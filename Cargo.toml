@@ -1,11 +1,11 @@
 [package]
 name = "pi_cache"
 version = "0.1.0"
-authors = ["zmyth <zmythleo@gmail.com>"]
+authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"
 readme = "README.md"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 keywords = ["pi", "cache", "lfu", "lru"]
 repository = "https://github.com/GaiaWorld/pi_cache"
 

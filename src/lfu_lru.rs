@@ -356,6 +356,7 @@ impl<K: Eq + Hash + Clone, V: Data> Lrus<K, V> {
     /// 频降
     fn frequency_down(&mut self) {
         let mut n = self.put_count / self.frequency_down_rate;
+
         for map in &self.arr {
             if n > map.len() {
                 n -= map.len();

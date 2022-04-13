@@ -1,5 +1,4 @@
-//! 队列哈希表
-//! 双层结构，队列和哈希表
+//! deque hashmap
 
 use std::hash::Hash;
 use std::collections::hash_map::Entry;
@@ -7,14 +6,14 @@ use pi_hash::XHashMap;
 use pi_slot_deque::{Deque, Slot};
 use slotmap::{SlotMap, DefaultKey};
 
-/// 缓存资源队列表
+/// deque hashmap
 #[derive(Debug)]
 pub struct DequeMap<K: Eq + Hash + Clone, V> {
-    /// 队列
+    /// deque
     deque: Deque<DefaultKey>,
-    /// 哈希表
+    /// hashmap
     map: XHashMap<K, DefaultKey>,
-    /// Slot表
+    /// SlotMap
     slot: Slot<DefaultKey, (K, V)>,
 }
 impl<K: Eq + Hash + Clone, V> Default for DequeMap<K, V> {
