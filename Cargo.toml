@@ -1,0 +1,19 @@
+[package]
+name = "pi_cache"
+version = "0.1.0"
+authors = ["zmyth <zmythleo@gmail.com>"]
+edition = "2021"
+description = "Implementation of LFU-LRU cache"
+readme = "README.md"
+license = "MIT"
+keywords = ["pi", "cache", "lfu", "lru"]
+repository = "https://github.com/GaiaWorld/pi_cache"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4"
+probabilistic-collections = "0.7"
+slotmap = "1.0"
+pi_slot_deque = "0.1"
+pi_hash = "0.1"
