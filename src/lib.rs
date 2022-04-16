@@ -5,7 +5,7 @@
 //! 当数据放入时，首先查找频次表，获得原频次，
 //!     如果没有该键，则为首次放入，接着查找CuckooFilter，如果在，则频次提升为1，如果不在则记录到过滤器。
 //!     将数据放入到指定频次LRU中后，从0频次开始进行LRU淘汰，然后依次向更大频次的LRU进行淘汰。
-//!     当过滤器的大小超过1024次后，清空过滤器，重新开始。
+//!     当过滤器的接近满的时候，清空过滤器，重新开始。默认过滤器条目数量为1024.
 //! 频降率: 总放入次数/缓存总条目数，每当频降率达到阈值后，将所有频次减半，8降为4， 4降为2，2降为1， 将1频次LRU的数据放入0频次的LRU中。
 //! 为了记录被take拿走的数据频次，并且为了快速找到指定key所在的频次LRU，需要维护一个key的频次表。
 //!
@@ -81,10 +81,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// GetMut by key
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get(k) {
-            unsafe { Some(&mut (self.lfu.slot.get_unchecked_mut(r.key).el.1)) }
-        } else {
-            None
+            if !r.key.is_null() {
+                return unsafe { Some(&mut self.lfu.slot.get_unchecked_mut(r.key.clone()).el.1)}
+            }
         }
+        None
     }
     /// 拿走的数据， 如果拿到了数据，就必须保证会调用put还回来
     pub fn take(&mut self, k: &K) -> Option<V> {
@@ -123,12 +124,15 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 }
             }
             hash_map::Entry::Vacant(e) => {
-                // 如果在窗口区中命中
+                // 如果在概率过滤器中命中
                 let frequency = if self.filter.contains(e.key()) {
                     self.lfu.metrics.insert2 += 1;
                     1
                 } else {
                     self.lfu.metrics.insert1 += 1;
+                    if self.filter.is_nearly_full() {
+                        self.filter.clear();
+                    }
                     self.filter.insert(&e.key());
                     0
                 };
@@ -246,7 +250,10 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        while self.cache.lfu.size > self.capacity && self.index < self.cache.lfu.arr.len() {
+        if self.cache.lfu.size <= self.capacity {
+            return None
+        }
+        while self.index < self.cache.lfu.arr.len() {
             if let Some(r) = self
                 .cache
                 .lfu
@@ -256,9 +263,8 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                 if r.el.1.timeout() < self.now {
                     self.cache.map.remove(&r.el.0);
                     self.cache.lfu.metrics.timeout += 1;
-                    return self.cache.lfu.pop(self.index);
-                } else {
-                    return None;
+                    self.cache.lfu.size -= r.el.1.size();
+                    return Some(unsafe { self.cache.lfu.pop(self.index).unwrap_unchecked().1 });
                 }
             }
             self.index += 1;
@@ -278,16 +284,15 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        while self.cache.lfu.size > self.capacity && self.index < self.cache.lfu.arr.len() {
-            if let Some(r) = self
-                .cache
-                .lfu
-                .slot
-                .get(self.cache.lfu.arr[self.index].head())
-            {
-                self.cache.map.remove(&r.el.0);
+        if self.cache.lfu.size <= self.capacity {
+            return None
+        }
+        while self.index < self.cache.lfu.arr.len() {
+            if let Some(r) = self.cache.lfu.pop(self.index) {
+                self.cache.map.remove(&r.0);
                 self.cache.lfu.metrics.evict += 1;
-                return self.cache.lfu.pop(self.index);
+                self.cache.lfu.size -= r.1.size();
+                return Some(r.1)
             }
             self.index += 1;
         }
@@ -372,7 +377,6 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
     }
     /// 删除数据
     fn delete(&mut self, i: usize, k: DefaultKey) -> Option<V> {
-        self.metrics.hit += 1;
         let v = unsafe { self.arr[i].remove(k, &mut self.slot).unwrap_unchecked().1 };
         self.size -= v.size();
         Some(v)
@@ -388,21 +392,18 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
             self.put_count += 1;
             return;
         }
-        // 如果放入次数达到上限，则增加频降次数，并清空放入次数
+        // 如果放入次数达到上限，进行频降， 增加频降次数，并清空放入次数
         self.frequency_down_count += 1;
         self.put_count = 0;
-        // 进行频降
         // 先将1合并到0
         let d = replace(&mut self.arr[1], Default::default());
-        self.arr[0].repair(d.head(), d.tail(), &mut self.slot);
+        self.arr[0].merge_back(d, &mut self.slot);
         // 调换位置
         self.arr[1..5].rotate_left(1);
     }
     /// 弹出
-    fn pop(&mut self, i: usize) -> Option<V> {
-        let v = unsafe { self.arr[i].pop_front(&mut self.slot).unwrap_unchecked().1 };
-        self.size -= v.size();
-        Some(v)
+    fn pop(&mut self, i: usize) -> Option<(K, V)> {
+        self.arr[i].pop_front(&mut self.slot)
     }
 }
 /// 数据条目
@@ -445,7 +446,7 @@ impl Item {
     }
 }
 
-// 测试定时器得延时情况
+
 #[cfg(test)]
 mod test_mod {
     use crate::*;
@@ -492,8 +493,49 @@ mod test_mod {
         assert(&cache, vec![2, 4, 1, 3]);
         cache.active_mut(&4);
         assert(&cache, vec![2, 1, 4, 3]);
+        assert_eq!(cache.contains_key(&2), Some(0));
+        assert_eq!(cache.contains_key(&1), Some(1));
         assert_eq!(cache.contains_key(&4), Some(1));
         assert_eq!(cache.contains_key(&3), Some(2));
+        // 测试移除后，在过滤器命中的情况下，数据频次应为1
+        cache.remove(&2);
+        assert_eq!(cache.contains_key(&2), None);
+        cache.put(2, R1(2, 2100, 0));
+        assert_eq!(cache.contains_key(&2), Some(1));
+        assert(&cache, vec![1, 4, 2, 3]);
+        // 测试最大频次为15
+        for i in 2..33 {
+            cache.active_mut(&2);
+            assert_eq!(cache.contains_key(&2), Some(if i > 15 {15}else{i}));
+        }
+        assert(&cache, vec![1, 4, 3, 2]);
+        assert_eq!(cache.contains_key(&1), Some(1));
+        assert_eq!(cache.contains_key(&2), Some(15));
+        assert_eq!(cache.contains_key(&3), Some(2));
+        assert_eq!(cache.contains_key(&4), Some(1));
+        cache.put(5, R1(5, 5000, 0));
+        println!("1---------");
+        assert_eq!(cache.contains_key(&5), Some(0));
+        assert_eq!(cache.contains_key(&1), Some(1));
+        
+        // 测试频降后的数据正确性
+        assert_eq!(cache.take(&2).unwrap().0, 2);
+        cache.put(2, R1(2, 2200, 0));
+        println!("2---------");
+        assert_eq!(cache.contains_key(&1), Some(0));
+        assert_eq!(cache.contains_key(&2), Some(8));
+        assert_eq!(cache.contains_key(&3), Some(1));
+        assert_eq!(cache.contains_key(&4), Some(0));
+        assert_eq!(cache.contains_key(&5), Some(0));
+        assert(&cache, vec![5, 1, 4, 3, 2]);
+        println!("cache size:{}, len:{}, count:{}", cache.size(), cache.len(), cache.count());
+        for i in cache.timeout_collect(0, 1000) {
+            println!("timeout_collect, {}", i.0);
+        };
+        for i in cache.capacity_collect(9000) {
+            println!("capacity_collect, {}", i.0);
+        };
+        assert(&cache, vec![4, 3, 2]);
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
