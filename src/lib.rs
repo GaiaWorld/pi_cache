@@ -246,7 +246,7 @@ pub struct TimeoutIter<'a, K: Eq + Hash + Clone, V: Data> {
     capacity: usize,
 }
 impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
-    type Item = V;
+    type Item = (K, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -264,7 +264,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                     self.cache.map.remove(&r.el.0);
                     self.cache.lfu.metrics.timeout += 1;
                     self.cache.lfu.size -= r.el.1.size();
-                    return Some(unsafe { self.cache.lfu.pop(self.index).unwrap_unchecked().1 });
+                    return self.cache.lfu.pop(self.index);
                 }
             }
             self.index += 1;
@@ -280,7 +280,7 @@ pub struct CapacityIter<'a, K: Eq + Hash + Clone, V: Data> {
     capacity: usize,
 }
 impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
-    type Item = V;
+    type Item = (K, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -292,7 +292,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
                 self.cache.map.remove(&r.0);
                 self.cache.lfu.metrics.evict += 1;
                 self.cache.lfu.size -= r.1.size();
-                return Some(r.1)
+                return Some(r)
             }
             self.index += 1;
         }
