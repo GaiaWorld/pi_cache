@@ -1,6 +1,6 @@
 [package]
 name = "pi_cache"
-version = "0.1.4"
+version = "0.1.5"
 authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"

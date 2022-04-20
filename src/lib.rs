@@ -58,8 +58,15 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             filter: CuckooFilter::from_entries_per_index(cuckoo_filter_window_size, 0.01, 8),
         }
     }
-    /// 判断是否有指定键的数据， 返回None表示没有，-1表示数据已被拿走，其余表示数据的频次
-    pub fn contains_key(&self, k: &K) -> Option<i8> {
+    /// 判断是否有指定键的数据
+    pub fn contains_key(&self, k: &K) -> bool {
+        if let Some(r) = self.map.get(k) {
+            return !r.key.is_null()
+        }
+        false
+    }
+    /// 获得指定键的频次， 返回None表示没有，-1表示数据已被拿走，其余表示数据的频次
+    pub fn get_frequency(&self, k: &K) -> Option<i8> {
         if let Some(r) = self.map.get(k) {
             if r.key.is_null() {
                 return Some(-1);
@@ -476,14 +483,14 @@ mod test_mod {
         assert(&cache, vec![1,2,3,4]);
         assert_eq!(cache.get(&1), Some(&R1(1, 1000, 0)));
         assert_eq!(cache.get(&2), Some(&R1(2, 2000, 0)));
-        assert_eq!(cache.contains_key(&3), Some(0));
-        assert_eq!(cache.contains_key(&5), None);
+        assert_eq!(cache.get_frequency(&3), Some(0));
+        assert_eq!(cache.get_frequency(&5), None);
         cache.take(&3);
         assert(&cache, vec![1,2,4]);
-        assert_eq!(cache.contains_key(&3), Some(-1));
+        assert_eq!(cache.get_frequency(&3), Some(-1));
         cache.put(3, R1(3, 3000, 0));
         assert(&cache, vec![1,2,4,3]);
-        assert_eq!(cache.contains_key(&3), Some(1));
+        assert_eq!(cache.get_frequency(&3), Some(1));
         {
             let r = cache.active_mut(&1);
             assert_eq!(r.unwrap(), &R1(1, 1000, 0));
@@ -493,40 +500,40 @@ mod test_mod {
         assert(&cache, vec![2, 4, 1, 3]);
         cache.active_mut(&4);
         assert(&cache, vec![2, 1, 4, 3]);
-        assert_eq!(cache.contains_key(&2), Some(0));
-        assert_eq!(cache.contains_key(&1), Some(1));
-        assert_eq!(cache.contains_key(&4), Some(1));
-        assert_eq!(cache.contains_key(&3), Some(2));
+        assert_eq!(cache.get_frequency(&2), Some(0));
+        assert_eq!(cache.get_frequency(&1), Some(1));
+        assert_eq!(cache.get_frequency(&4), Some(1));
+        assert_eq!(cache.get_frequency(&3), Some(2));
         // 测试移除后，在过滤器命中的情况下，数据频次应为1
         cache.remove(&2);
-        assert_eq!(cache.contains_key(&2), None);
+        assert_eq!(cache.get_frequency(&2), None);
         cache.put(2, R1(2, 2100, 0));
-        assert_eq!(cache.contains_key(&2), Some(1));
+        assert_eq!(cache.get_frequency(&2), Some(1));
         assert(&cache, vec![1, 4, 2, 3]);
         // 测试最大频次为15
         for i in 2..33 {
             cache.active_mut(&2);
-            assert_eq!(cache.contains_key(&2), Some(if i > 15 {15}else{i}));
+            assert_eq!(cache.get_frequency(&2), Some(if i > 15 {15}else{i}));
         }
         assert(&cache, vec![1, 4, 3, 2]);
-        assert_eq!(cache.contains_key(&1), Some(1));
-        assert_eq!(cache.contains_key(&2), Some(15));
-        assert_eq!(cache.contains_key(&3), Some(2));
-        assert_eq!(cache.contains_key(&4), Some(1));
+        assert_eq!(cache.get_frequency(&1), Some(1));
+        assert_eq!(cache.get_frequency(&2), Some(15));
+        assert_eq!(cache.get_frequency(&3), Some(2));
+        assert_eq!(cache.get_frequency(&4), Some(1));
         cache.put(5, R1(5, 5000, 0));
         println!("1---------");
-        assert_eq!(cache.contains_key(&5), Some(0));
-        assert_eq!(cache.contains_key(&1), Some(1));
+        assert_eq!(cache.get_frequency(&5), Some(0));
+        assert_eq!(cache.get_frequency(&1), Some(1));
         
         // 测试频降后的数据正确性
         assert_eq!(cache.take(&2).unwrap().0, 2);
         cache.put(2, R1(2, 2200, 0));
         println!("2---------");
-        assert_eq!(cache.contains_key(&1), Some(0));
-        assert_eq!(cache.contains_key(&2), Some(8));
-        assert_eq!(cache.contains_key(&3), Some(1));
-        assert_eq!(cache.contains_key(&4), Some(0));
-        assert_eq!(cache.contains_key(&5), Some(0));
+        assert_eq!(cache.get_frequency(&1), Some(0));
+        assert_eq!(cache.get_frequency(&2), Some(8));
+        assert_eq!(cache.get_frequency(&3), Some(1));
+        assert_eq!(cache.get_frequency(&4), Some(0));
+        assert_eq!(cache.get_frequency(&5), Some(0));
         assert(&cache, vec![5, 1, 4, 3, 2]);
         println!("cache size:{}, len:{}, count:{}", cache.size(), cache.len(), cache.count());
         for i in cache.timeout_collect(0, 1000) {
