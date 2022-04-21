@@ -214,13 +214,13 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             index: 1,
         }
     }
-    /// 超时整理方法， 参数为毫秒时间及最小容量，清理最小容量外的超时数据
-    pub fn timeout_collect(&mut self, now: usize, capacity: usize) -> TimeoutIter<'_, K, V> {
+    /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
+    pub fn timeout_collect(&mut self, capacity: usize, now: u64) -> TimeoutIter<'_, K, V> {
         TimeoutIter {
             cache: self,
             index: 0,
-            now,
             capacity,
+            now,
         }
     }
     /// 超量整理方法， 参数为容量， 按照频率优先， 同频先进先出的原则，清理超出容量的数据
@@ -240,7 +240,7 @@ pub trait Data {
         1
     }
     /// 数据的超时时间，毫秒时间
-    fn timeout(&self) -> usize {
+    fn timeout(&self) -> u64 {
         0
     }
 }
@@ -249,8 +249,8 @@ pub trait Data {
 pub struct TimeoutIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: &'a mut Cache<K, V>,
     index: usize,
-    now: usize,
     capacity: usize,
+    now: u64,
 }
 impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
     type Item = (K, V);
@@ -459,7 +459,7 @@ mod test_mod {
     use crate::*;
 
     #[derive(Debug, Eq, PartialEq)]
-    struct R1(usize, usize, usize);
+    struct R1(usize, usize, u64);
 
     impl Data for R1 {
         /// 资源的大小
@@ -467,7 +467,7 @@ mod test_mod {
             self.1
         }
         /// 超时时间
-        fn timeout(&self) -> usize {
+        fn timeout(&self) -> u64 {
             self.2
         }
     }
