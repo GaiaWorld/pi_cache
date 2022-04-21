@@ -267,7 +267,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                 .slot
                 .get(self.cache.lfu.arr[self.index].head())
             {
-                if r.el.1.timeout() < self.now {
+                if r.el.1.timeout() > self.now {
                     self.cache.map.remove(&r.el.0);
                     self.cache.lfu.metrics.timeout += 1;
                     self.cache.lfu.size -= r.el.1.size();
