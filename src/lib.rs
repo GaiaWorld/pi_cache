@@ -11,7 +11,7 @@
 //!
 
 use pi_hash::XHashMap;
-use pi_slot_deque::{Deque, Slot, Iter as SlotIter};
+use pi_slot_deque::{Deque, Iter as SlotIter, Slot};
 use probabilistic_collections::cuckoo::CuckooFilter;
 use slotmap::{DefaultKey, Key};
 use std::collections::hash_map;
@@ -61,7 +61,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 判断是否有指定键的数据
     pub fn contains_key(&self, k: &K) -> bool {
         if let Some(r) = self.map.get(k) {
-            return !r.key.is_null()
+            return !r.key.is_null();
         }
         false
     }
@@ -70,8 +70,10 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         if let Some(r) = self.map.get(k) {
             if r.key.is_null() {
                 return Some(-1);
-            }else{
-                return Some((r.frequency >> (self.lfu.frequency_down_count - r.frequency_down_count)) as i8)
+            } else {
+                return Some(
+                    (r.frequency >> (self.lfu.frequency_down_count - r.frequency_down_count)) as i8,
+                );
             }
         }
         None
@@ -89,7 +91,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get(k) {
             if !r.key.is_null() {
-                return unsafe { Some(&mut self.lfu.slot.get_unchecked_mut(r.key.clone()).el.1)}
+                return unsafe { Some(&mut self.lfu.slot.get_unchecked_mut(r.key.clone()).el.1) };
             }
         }
         None
@@ -172,7 +174,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 self.lfu.arr[old_i].repair(prev, next, &mut self.lfu.slot);
                 // 添加进新队列的尾部
                 self.lfu.arr[i].push_key_back(r.key, &mut self.lfu.slot);
-                return unsafe { Some(&mut (self.lfu.slot.get_unchecked_mut(r.key).el.1)) }
+                return unsafe { Some(&mut (self.lfu.slot.get_unchecked_mut(r.key).el.1)) };
             }
         }
         self.lfu.metrics.miss += 1;
@@ -188,6 +190,19 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 self.lfu.delete(i, r.key)
             }
             None => None,
+        }
+    }
+    /// 移走垃圾回收的数据
+    pub fn garbage(&mut self, k: K) -> Option<V> {
+        match self.map.entry(k) {
+            hash_map::Entry::Occupied(e) => {
+                if e.get().frequency_down_count == 0 {
+                    self.lfu.slot.remove(e.remove().key).map(|node| node.el.1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
     /// 全部数量，包括被拿走的数据
@@ -212,6 +227,23 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             cache: self,
             iter: self.lfu.arr[0].iter(&self.lfu.slot),
             index: 1,
+        }
+    }
+    /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
+    pub fn timeout_ref_collect(&mut self, capacity: usize, now: u64) -> TimeoutRefIter<'_, K, V> {
+        TimeoutRefIter {
+            cache: self,
+            index: 0,
+            capacity,
+            now,
+        }
+    }
+    /// 超量整理方法， 参数为容量， 按照频率优先， 同频先进先出的原则，清理超出容量的数据
+    pub fn capacity_ref_collect(&mut self, capacity: usize) -> CapacityRefIter<'_, K, V> {
+        CapacityRefIter {
+            cache: self,
+            index: 0,
+            capacity,
         }
     }
     /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
@@ -245,6 +277,75 @@ pub trait Data {
     }
 }
 
+
+/// 超时引用迭代器
+pub struct TimeoutRefIter<'a, K: Eq + Hash + Clone, V: Data> {
+    cache: &'a mut Cache<K, V>,
+    index: usize,
+    capacity: usize,
+    now: u64,
+}
+impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
+    type Item = &'a (K, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cache.lfu.size <= self.capacity {
+            return None;
+        }
+        while self.index < self.cache.lfu.arr.len() {
+            if let Some(r) = self
+                .cache
+                .lfu
+                .slot
+                .get(self.cache.lfu.arr[self.index].head())
+            {
+                if r.el.1.timeout() > self.now {
+                    if let Some(item) = self.cache.map.get_mut(&r.el.0) {
+                        item.frequency_down_count = 0;
+                    }
+                    self.cache.lfu.metrics.timeout += 1;
+                    self.cache.lfu.size -= r.el.1.size();
+                    let k = self.cache.lfu.pop_key(self.index).unwrap();
+                    return Some(unsafe {&(self.cache.lfu.slot.get_unchecked(k).el)});
+                }
+            }
+            self.index += 1;
+        }
+        None
+    }
+}
+
+/// 容量引用迭代器
+pub struct CapacityRefIter<'a, K: Eq + Hash + Clone, V: Data> {
+    cache: &'a mut Cache<K, V>,
+    index: usize,
+    capacity: usize,
+}
+impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityRefIter<'a, K, V> {
+    type Item = &'a (K, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cache.lfu.size <= self.capacity {
+            return None;
+        }
+        while self.index < self.cache.lfu.arr.len() {
+            if let Some(k) = self.cache.lfu.pop_key(self.index) {
+                let r = unsafe {&(self.cache.lfu.slot.get_unchecked(k).el)};
+                if let Some(item) = self.cache.map.get_mut(&r.0) {
+                    item.frequency_down_count = 0;
+                }
+                self.cache.lfu.metrics.evict += 1;
+                self.cache.lfu.size -= r.1.size();
+                return Some(r);
+            }
+            self.index += 1;
+        }
+        None
+    }
+}
+
 /// 超时迭代器
 pub struct TimeoutIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: &'a mut Cache<K, V>,
@@ -258,7 +359,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cache.lfu.size <= self.capacity {
-            return None
+            return None;
         }
         while self.index < self.cache.lfu.arr.len() {
             if let Some(r) = self
@@ -292,14 +393,14 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cache.lfu.size <= self.capacity {
-            return None
+            return None;
         }
         while self.index < self.cache.lfu.arr.len() {
             if let Some(r) = self.cache.lfu.pop(self.index) {
                 self.cache.map.remove(&r.0);
                 self.cache.lfu.metrics.evict += 1;
                 self.cache.lfu.size -= r.1.size();
-                return Some(r)
+                return Some(r);
             }
             self.index += 1;
         }
@@ -319,10 +420,10 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for Iter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(r) = self.iter.next() {
-                return Some(r)
+                return Some(r);
             }
             if self.index >= self.cache.lfu.arr.len() {
-                return None
+                return None;
             }
             self.iter = self.cache.lfu.arr[self.index].iter(&self.cache.lfu.slot);
             self.index += 1;
@@ -378,7 +479,7 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
             size: 0,
             frequency_down_rate,
             metrics: Default::default(),
-            frequency_down_count: 0,
+            frequency_down_count: 1,
             put_count: 0,
         }
     }
@@ -411,6 +512,10 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
     /// 弹出
     fn pop(&mut self, i: usize) -> Option<(K, V)> {
         self.arr[i].pop_front(&mut self.slot)
+    }
+    /// 弹出key
+    fn pop_key(&mut self, i: usize) -> Option<DefaultKey> {
+        self.arr[i].pop_key_front(&mut self.slot)
     }
 }
 /// 数据条目
@@ -453,7 +558,6 @@ impl Item {
     }
 }
 
-
 #[cfg(test)]
 mod test_mod {
     use crate::*;
@@ -474,22 +578,21 @@ mod test_mod {
 
     #[test]
     pub fn test() {
-
         let mut cache: Cache<usize, R1> = Default::default();
         cache.put(1, R1(1, 1000, 0));
         cache.put(2, R1(2, 2000, 0));
         cache.put(3, R1(3, 3000, 0));
         cache.put(4, R1(4, 3000, 0));
-        assert(&cache, vec![1,2,3,4]);
+        assert(&cache, vec![1, 2, 3, 4]);
         assert_eq!(cache.get(&1), Some(&R1(1, 1000, 0)));
         assert_eq!(cache.get(&2), Some(&R1(2, 2000, 0)));
         assert_eq!(cache.get_frequency(&3), Some(0));
         assert_eq!(cache.get_frequency(&5), None);
         cache.take(&3);
-        assert(&cache, vec![1,2,4]);
+        assert(&cache, vec![1, 2, 4]);
         assert_eq!(cache.get_frequency(&3), Some(-1));
         cache.put(3, R1(3, 3000, 0));
-        assert(&cache, vec![1,2,4,3]);
+        assert(&cache, vec![1, 2, 4, 3]);
         assert_eq!(cache.get_frequency(&3), Some(1));
         {
             let r = cache.active_mut(&1);
@@ -513,7 +616,7 @@ mod test_mod {
         // 测试最大频次为15
         for i in 2..33 {
             cache.active_mut(&2);
-            assert_eq!(cache.get_frequency(&2), Some(if i > 15 {15}else{i}));
+            assert_eq!(cache.get_frequency(&2), Some(if i > 15 { 15 } else { i }));
         }
         assert(&cache, vec![1, 4, 3, 2]);
         assert_eq!(cache.get_frequency(&1), Some(1));
@@ -524,7 +627,7 @@ mod test_mod {
         println!("1---------");
         assert_eq!(cache.get_frequency(&5), Some(0));
         assert_eq!(cache.get_frequency(&1), Some(1));
-        
+
         // 测试频降后的数据正确性
         assert_eq!(cache.take(&2).unwrap().0, 2);
         cache.put(2, R1(2, 2200, 0));
@@ -535,21 +638,25 @@ mod test_mod {
         assert_eq!(cache.get_frequency(&4), Some(0));
         assert_eq!(cache.get_frequency(&5), Some(0));
         assert(&cache, vec![5, 1, 4, 3, 2]);
-        println!("cache size:{}, len:{}, count:{}", cache.size(), cache.len(), cache.count());
+        println!(
+            "cache size:{}, len:{}, count:{}",
+            cache.size(),
+            cache.len(),
+            cache.count()
+        );
         for i in cache.timeout_collect(0, 1000) {
             println!("timeout_collect, {}", i.0);
-        };
+        }
         for i in cache.capacity_collect(9000) {
             println!("capacity_collect, {}", i.0);
-        };
+        }
         assert(&cache, vec![4, 3, 2]);
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
         for r in c.iter() {
             assert_eq!(r.0, vec[i]);
-            i+=1;
+            i += 1;
         }
-        
     }
 }
