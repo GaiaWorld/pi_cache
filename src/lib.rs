@@ -23,9 +23,9 @@ use std::mem::replace;
 /// 最大频次
 const FREQUENCY_MAX: u32 = 15;
 // 默认CuckooFilter窗口大小
-const WINDOW_SIZE: usize = 1024;
+pub const WINDOW_SIZE: usize = 1024;
 // 默认的整理率，总放入次数/缓存总条目数
-const FREQUENCY_DOWN_RATE: usize = 8;
+pub const FREQUENCY_DOWN_RATE: usize = 8;
 
 /// Cache缓存， 基于LFU-LRU
 pub struct Cache<K: Eq + Hash + Clone, V: Data> {
