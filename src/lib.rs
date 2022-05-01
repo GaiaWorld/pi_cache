@@ -8,6 +8,7 @@
 //!     当过滤器的接近满的时候，清空过滤器，重新开始。默认过滤器条目数量为1024.
 //! 频降率: 总放入次数/缓存总条目数，每当频降率达到阈值后，将所有频次减半，8降为4， 4降为2，2降为1， 将1频次LRU的数据放入0频次的LRU中。
 //! 为了记录被take拿走的数据频次，并且为了快速找到指定key所在的频次LRU，需要维护一个key的频次表。
+//! 支持垃圾标记和引用整理，将数据弹出频率队列，但保留数据本身，用collect方法真正移除。 如果在collect调用前，有其他的take和active_mut，则将数据重新放入频率队列。
 //!
 
 use pi_hash::XHashMap;
@@ -16,6 +17,7 @@ use probabilistic_collections::cuckoo::CuckooFilter;
 use slotmap::{DefaultKey, Key};
 use std::collections::hash_map;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::mem::replace;
 
 /// 最大频次
@@ -65,18 +67,20 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         false
     }
-    /// 获得指定键的频次， 返回None表示没有，-1表示数据已被拿走，其余表示数据的频次
-    pub fn get_frequency(&self, k: &K) -> Option<i8> {
+    /// 获得指定键的频次
+    pub fn get_frequency(&self, k: &K) -> FrequencyState {
         if let Some(r) = self.map.get(k) {
-            if r.key.is_null() {
-                return Some(-1);
+            return if r.key.is_null() {
+                FrequencyState::TakenAway
+            } else if r.frequency_down_count == 0 {
+                FrequencyState::Garbaged
             } else {
-                return Some(
-                    (r.frequency >> (self.lfu.frequency_down_count - r.frequency_down_count)) as i8,
-                );
-            }
+                FrequencyState::Frequency(
+                    (r.frequency >> (self.lfu.frequency_down_count - r.frequency_down_count)) as u8,
+                )
+            };
         }
-        None
+        FrequencyState::None
     }
     /// 获得指定键的数据
     pub fn get(&self, k: &K) -> Option<&V> {
@@ -98,17 +102,29 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     }
     /// 拿走的数据， 如果拿到了数据，就必须保证会调用put还回来
     pub fn take(&mut self, k: &K) -> Option<V> {
-        if let Some(r) = self.map.get_mut(k) {
-            if !r.key.is_null() {
-                let key = replace(&mut r.key, DefaultKey::null());
-                // 获得当前该键所在的频率段
-                let i = r.get(self.lfu.frequency_down_count);
-                self.lfu.metrics.hit += 1;
-                return self.lfu.delete(i, key);
+        match self.map.entry(k.clone()) {
+            hash_map::Entry::Occupied(mut e) => {
+                let r = e.get_mut();
+                if r.key.is_null() {
+                    return None;
+                }
+                return if r.frequency_down_count > 0 {
+                    let key = replace(&mut r.key, DefaultKey::null());
+                    // 获得当前该键所在的频率段
+                    let i = r.get(self.lfu.frequency_down_count);
+                    self.lfu.metrics.hit += 1;
+                    self.lfu.delete(i, key)
+                } else {
+                    let r = e.remove();
+                    // 垃圾回收状态，从slot中拿走
+                    unsafe { Some(self.lfu.slot.remove(r.key).unwrap_unchecked().el.1) }
+                };
+            }
+            hash_map::Entry::Vacant(_) => {
+                self.lfu.metrics.miss += 1;
+                None
             }
         }
-        self.lfu.metrics.miss += 1;
-        None
     }
     /// 放入的数据，返回Some(V)表示被替换的数据
     pub fn put(&mut self, k: K, v: V) -> Option<V> {
@@ -159,11 +175,14 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 激活并获取可写应用，会增加频次和最后使用时间，等于拿走并立即还回来，但性能更高
     pub fn active_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get_mut(k) {
-            if !r.key.is_null() {
-                // 先频降
-                self.lfu.frequency_down();
-                self.lfu.metrics.hit += 1;
-                self.lfu.metrics.put += 1;
+            if r.key.is_null() {
+                return None;
+            }
+            // 先频降
+            self.lfu.frequency_down();
+            self.lfu.metrics.hit += 1;
+            self.lfu.metrics.put += 1;
+            return if r.frequency_down_count > 0 {
                 // 获取新旧位置
                 let (i, old_i) = r.put(self.lfu.frequency_down_count);
                 let (prev, next) = unsafe {
@@ -174,30 +193,69 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 self.lfu.arr[old_i].repair(prev, next, &mut self.lfu.slot);
                 // 添加进新队列的尾部
                 self.lfu.arr[i].push_key_back(r.key, &mut self.lfu.slot);
-                return unsafe { Some(&mut (self.lfu.slot.get_unchecked_mut(r.key).el.1)) };
-            }
+                unsafe { Some(&mut (self.lfu.slot.get_unchecked_mut(r.key).el.1)) }
+            } else {
+                r.frequency_down_count = self.lfu.frequency_down_count;
+                r.frequency = 1;
+                // 垃圾回收状态，重新添加进队列1的尾部
+                self.lfu.arr[1].push_key_back(r.key, &mut self.lfu.slot);
+                let v = unsafe { &mut (self.lfu.slot.get_unchecked_mut(r.key).el.1) };
+                self.lfu.size += v.size();
+                Some(v)
+            };
         }
         self.lfu.metrics.miss += 1;
         None
     }
     /// 移走
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        match self.map.remove(k) {
-            Some(mut r) => {
-                self.lfu.metrics.remove += 1;
+        if let Some(r) = self.map.remove(k) {
+            // 已经被拿走，不可移除
+            if r.key.is_null() {
+                return None;
+            }
+            self.lfu.metrics.remove += 1;
+            return if r.frequency_down_count > 0 {
                 // 获得当前该键所在的频率段
                 let i = r.get(self.lfu.frequency_down_count);
                 self.lfu.delete(i, r.key)
-            }
-            None => None,
+            } else {
+                // 垃圾回收状态，从slot中拿走
+                unsafe { Some(self.lfu.slot.remove(r.key).unwrap_unchecked().el.1) }
+            };
         }
+        None
+    }
+    /// 将指定键的数据标记为垃圾回收，从频率队列中移除，但保留数据本身， 返回数据引用
+    pub fn garbage(&mut self, k: &K) -> Option<&V> {
+        if let Some(r) = self.map.get_mut(&k) {
+            // 已经被拿走，或垃圾回收状态，不可标记
+            if r.key.is_null() || r.frequency_down_count == 0 {
+                return None;
+            }
+            let i = r.get(self.lfu.frequency_down_count);
+            r.frequency_down_count = 0;
+            let (prev, next) = unsafe {
+                let n = self.lfu.slot.get_unchecked(r.key);
+                (n.prev(), n.next())
+            };
+            // 从队列中删除
+            self.lfu.arr[i].repair(prev, next, &mut self.lfu.slot);
+            self.lfu.metrics.garbage += 1;
+            let r = unsafe { &(self.lfu.slot.get_unchecked(r.key).el) };
+            self.lfu.size -= r.1.size();
+            return Some(&r.1);
+        }
+        None
     }
     /// 移走垃圾回收的数据
-    pub fn garbage(&mut self, k: K) -> Option<V> {
+    pub fn collect(&mut self, k: K) -> Option<V> {
+        self.lfu.metrics.collect += 1;
         match self.map.entry(k) {
             hash_map::Entry::Occupied(e) => {
                 if e.get().frequency_down_count == 0 {
-                    self.lfu.slot.remove(e.remove().key).map(|node| node.el.1)
+                    let r = e.remove();
+                    unsafe { Some(self.lfu.slot.remove(r.key).unwrap_unchecked().el.1) }
                 } else {
                     None
                 }
@@ -232,18 +290,20 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
     pub fn timeout_ref_collect(&mut self, capacity: usize, now: u64) -> TimeoutRefIter<'_, K, V> {
         TimeoutRefIter {
-            cache: self,
+            cache: self as *mut Self,
             index: 0,
             capacity,
             now,
+            _p: PhantomData,
         }
     }
     /// 超量整理方法， 参数为容量， 按照频率优先， 同频先进先出的原则，清理超出容量的数据
     pub fn capacity_ref_collect(&mut self, capacity: usize) -> CapacityRefIter<'_, K, V> {
         CapacityRefIter {
-            cache: self,
+            cache: self as *mut Self,
             index: 0,
             capacity,
+            _p: PhantomData,
         }
     }
     /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
@@ -277,37 +337,33 @@ pub trait Data {
     }
 }
 
-
 /// 超时引用迭代器
 pub struct TimeoutRefIter<'a, K: Eq + Hash + Clone, V: Data> {
-    cache: &'a mut Cache<K, V>,
+    cache: *mut Cache<K, V>,
     index: usize,
     capacity: usize,
     now: u64,
+    _p: PhantomData<&'a Cache<K, V>>,
 }
 impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
     type Item = &'a (K, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cache.lfu.size <= self.capacity {
+        let cache = unsafe { &mut *self.cache };
+        if cache.lfu.size <= self.capacity {
             return None;
         }
-        while self.index < self.cache.lfu.arr.len() {
-            if let Some(r) = self
-                .cache
-                .lfu
-                .slot
-                .get(self.cache.lfu.arr[self.index].head())
-            {
+        while self.index < cache.lfu.arr.len() {
+            if let Some(r) = cache.lfu.slot.get(cache.lfu.arr[self.index].head()) {
                 if r.el.1.timeout() > self.now {
-                    if let Some(item) = self.cache.map.get_mut(&r.el.0) {
+                    if let Some(item) = cache.map.get_mut(&r.el.0) {
                         item.frequency_down_count = 0;
                     }
-                    self.cache.lfu.metrics.timeout += 1;
-                    self.cache.lfu.size -= r.el.1.size();
-                    let k = self.cache.lfu.pop_key(self.index).unwrap();
-                    return Some(unsafe {&(self.cache.lfu.slot.get_unchecked(k).el)});
+                    cache.lfu.metrics.timeout += 1;
+                    cache.lfu.size -= r.el.1.size();
+                    let k = cache.lfu.pop_key(self.index).unwrap();
+                    return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
                 }
             }
             self.index += 1;
@@ -318,26 +374,28 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
 
 /// 容量引用迭代器
 pub struct CapacityRefIter<'a, K: Eq + Hash + Clone, V: Data> {
-    cache: &'a mut Cache<K, V>,
+    cache: *mut Cache<K, V>,
     index: usize,
     capacity: usize,
+    _p: PhantomData<&'a Cache<K, V>>,
 }
 impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityRefIter<'a, K, V> {
     type Item = &'a (K, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cache.lfu.size <= self.capacity {
+        let cache = unsafe { &mut *self.cache };
+        if cache.lfu.size <= self.capacity {
             return None;
         }
-        while self.index < self.cache.lfu.arr.len() {
-            if let Some(k) = self.cache.lfu.pop_key(self.index) {
-                let r = unsafe {&(self.cache.lfu.slot.get_unchecked(k).el)};
-                if let Some(item) = self.cache.map.get_mut(&r.0) {
+        while self.index < cache.lfu.arr.len() {
+            if let Some(k) = cache.lfu.pop_key(self.index) {
+                let r = unsafe { &(cache.lfu.slot.get_unchecked(k).el) };
+                if let Some(item) = cache.map.get_mut(&r.0) {
                     item.frequency_down_count = 0;
                 }
-                self.cache.lfu.metrics.evict += 1;
-                self.cache.lfu.size -= r.1.size();
+                cache.lfu.metrics.evict += 1;
+                cache.lfu.size -= r.1.size();
                 return Some(r);
             }
             self.index += 1;
@@ -430,7 +488,18 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for Iter<'a, K, V> {
         }
     }
 }
-
+/// 数据的频率状态
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrequencyState {
+    /// 不存在
+    None,
+    /// 被拿走
+    TakenAway,
+    /// 被标记为垃圾
+    Garbaged,
+    /// 频率
+    Frequency(u8),
+}
 /// 统计数据
 #[derive(Clone, Default, Debug)]
 pub struct Metrics {
@@ -448,6 +517,10 @@ pub struct Metrics {
     pub put: usize,
     /// 移除次数
     pub remove: usize,
+    /// 垃圾标记次数
+    pub garbage: usize,
+    /// 垃圾清理次数
+    pub collect: usize,
     /// 超时清理次数
     pub timeout: usize,
     /// 超过容量的驱除次数
@@ -455,7 +528,7 @@ pub struct Metrics {
 }
 
 /// 频率表
-pub struct Lfu<K: Eq + Hash + Clone, V: Data> {
+struct Lfu<K: Eq + Hash + Clone, V: Data> {
     /// 不同数据访问频次的LRU，频次为0,1,2-3,4-7,8-15
     arr: [Deque<DefaultKey>; 5],
     /// SlotMap
@@ -524,17 +597,15 @@ struct Item {
     key: DefaultKey,
     /// 数据的频次
     frequency: u32,
-    /// 当前频次所在的频降周期数
+    /// 当前频次所在的频降周期数，为0表示在垃圾回收状态
     frequency_down_count: u32,
 }
 impl Item {
-    /// 修正频次，并获得频次所在的位置
+    /// 获得频次所在的位置
     #[inline]
-    fn get(&mut self, frequency_down_count: u32) -> usize {
-        if frequency_down_count > self.frequency_down_count {
-            self.frequency = self.frequency >> (frequency_down_count - self.frequency_down_count);
-        }
-        (u32::BITS - self.frequency.leading_zeros()) as usize
+    fn get(&self, frequency_down_count: u32) -> usize {
+        let i = self.frequency >> (frequency_down_count - self.frequency_down_count);
+        (u32::BITS - i.leading_zeros()) as usize
     }
     /// 增加频次，设置当前频降数，并获得新旧频次所在的位置
     #[inline]
@@ -586,14 +657,14 @@ mod test_mod {
         assert(&cache, vec![1, 2, 3, 4]);
         assert_eq!(cache.get(&1), Some(&R1(1, 1000, 0)));
         assert_eq!(cache.get(&2), Some(&R1(2, 2000, 0)));
-        assert_eq!(cache.get_frequency(&3), Some(0));
-        assert_eq!(cache.get_frequency(&5), None);
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(0));
+        assert_eq!(cache.get_frequency(&5), FrequencyState::None);
         cache.take(&3);
         assert(&cache, vec![1, 2, 4]);
-        assert_eq!(cache.get_frequency(&3), Some(-1));
+        assert_eq!(cache.get_frequency(&3), FrequencyState::TakenAway);
         cache.put(3, R1(3, 3000, 0));
         assert(&cache, vec![1, 2, 4, 3]);
-        assert_eq!(cache.get_frequency(&3), Some(1));
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(1));
         {
             let r = cache.active_mut(&1);
             assert_eq!(r.unwrap(), &R1(1, 1000, 0));
@@ -603,40 +674,43 @@ mod test_mod {
         assert(&cache, vec![2, 4, 1, 3]);
         cache.active_mut(&4);
         assert(&cache, vec![2, 1, 4, 3]);
-        assert_eq!(cache.get_frequency(&2), Some(0));
-        assert_eq!(cache.get_frequency(&1), Some(1));
-        assert_eq!(cache.get_frequency(&4), Some(1));
-        assert_eq!(cache.get_frequency(&3), Some(2));
+        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(0));
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(1));
+        assert_eq!(cache.get_frequency(&4), FrequencyState::Frequency(1));
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(2));
         // 测试移除后，在过滤器命中的情况下，数据频次应为1
         cache.remove(&2);
-        assert_eq!(cache.get_frequency(&2), None);
+        assert_eq!(cache.get_frequency(&2), FrequencyState::None);
         cache.put(2, R1(2, 2100, 0));
-        assert_eq!(cache.get_frequency(&2), Some(1));
+        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(1));
         assert(&cache, vec![1, 4, 2, 3]);
         // 测试最大频次为15
         for i in 2..33 {
             cache.active_mut(&2);
-            assert_eq!(cache.get_frequency(&2), Some(if i > 15 { 15 } else { i }));
+            assert_eq!(
+                cache.get_frequency(&2),
+                FrequencyState::Frequency(if i > 15 { 15 } else { i })
+            );
         }
         assert(&cache, vec![1, 4, 3, 2]);
-        assert_eq!(cache.get_frequency(&1), Some(1));
-        assert_eq!(cache.get_frequency(&2), Some(15));
-        assert_eq!(cache.get_frequency(&3), Some(2));
-        assert_eq!(cache.get_frequency(&4), Some(1));
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(1));
+        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(15));
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(2));
+        assert_eq!(cache.get_frequency(&4), FrequencyState::Frequency(1));
         cache.put(5, R1(5, 5000, 0));
         println!("1---------");
-        assert_eq!(cache.get_frequency(&5), Some(0));
-        assert_eq!(cache.get_frequency(&1), Some(1));
+        assert_eq!(cache.get_frequency(&5), FrequencyState::Frequency(0));
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(1));
 
         // 测试频降后的数据正确性
         assert_eq!(cache.take(&2).unwrap().0, 2);
         cache.put(2, R1(2, 2200, 0));
         println!("2---------");
-        assert_eq!(cache.get_frequency(&1), Some(0));
-        assert_eq!(cache.get_frequency(&2), Some(8));
-        assert_eq!(cache.get_frequency(&3), Some(1));
-        assert_eq!(cache.get_frequency(&4), Some(0));
-        assert_eq!(cache.get_frequency(&5), Some(0));
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(0));
+        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(8));
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(1));
+        assert_eq!(cache.get_frequency(&4), FrequencyState::Frequency(0));
+        assert_eq!(cache.get_frequency(&5), FrequencyState::Frequency(0));
         assert(&cache, vec![5, 1, 4, 3, 2]);
         println!(
             "cache size:{}, len:{}, count:{}",
@@ -644,13 +718,17 @@ mod test_mod {
             cache.len(),
             cache.count()
         );
-        for i in cache.timeout_collect(0, 1000) {
-            println!("timeout_collect, {}", i.0);
+        for i in cache.timeout_ref_collect(0, 1000) {
+            println!("timeout_ref_collect, {}", i.0);
         }
-        for i in cache.capacity_collect(9000) {
-            println!("capacity_collect, {}", i.0);
+        for i in cache.capacity_ref_collect(9000) {
+            println!("capacity_ref_collect, {}", i.0);
         }
-        assert(&cache, vec![4, 3, 2]);
+        assert_eq!(cache.get_frequency(&5), FrequencyState::Garbaged);
+        cache.active_mut(&5);
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Garbaged);
+        cache.collect(1).unwrap();
+        assert(&cache, vec![4, 3, 5, 2]);
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
