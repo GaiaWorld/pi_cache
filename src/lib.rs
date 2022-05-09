@@ -357,14 +357,15 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
         while self.index < cache.lfu.arr.len() {
             if let Some(r) = cache.lfu.slot.get(cache.lfu.arr[self.index].head()) {
                 if r.el.1.timeout() > self.now {
-                    if let Some(item) = cache.map.get_mut(&r.el.0) {
-                        item.frequency_down_count = 0;
-                    }
-                    cache.lfu.metrics.timeout += 1;
-                    cache.lfu.size -= r.el.1.size();
-                    let k = cache.lfu.pop_key(self.index).unwrap();
-                    return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
+                    return None;
                 }
+                if let Some(item) = cache.map.get_mut(&r.el.0) {
+                    item.frequency_down_count = 0;
+                }
+                cache.lfu.metrics.timeout += 1;
+                cache.lfu.size -= r.el.1.size();
+                let k = cache.lfu.pop_key(self.index).unwrap();
+                return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
             }
             self.index += 1;
         }
@@ -427,11 +428,12 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                 .get(self.cache.lfu.arr[self.index].head())
             {
                 if r.el.1.timeout() > self.now {
-                    self.cache.map.remove(&r.el.0);
-                    self.cache.lfu.metrics.timeout += 1;
-                    self.cache.lfu.size -= r.el.1.size();
-                    return self.cache.lfu.pop(self.index);
+                    return None;
                 }
+                self.cache.map.remove(&r.el.0);
+                self.cache.lfu.metrics.timeout += 1;
+                self.cache.lfu.size -= r.el.1.size();
+                return self.cache.lfu.pop(self.index);
             }
             self.index += 1;
         }
