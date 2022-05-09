@@ -356,16 +356,15 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
         }
         while self.index < cache.lfu.arr.len() {
             if let Some(r) = cache.lfu.slot.get(cache.lfu.arr[self.index].head()) {
-                if r.el.1.timeout() > self.now {
-                    return None;
+                if r.el.1.timeout() < self.now {
+                    if let Some(item) = cache.map.get_mut(&r.el.0) {
+                        item.frequency_down_count = 0;
+                    }
+                    cache.lfu.metrics.timeout += 1;
+                    cache.lfu.size -= r.el.1.size();
+                    let k = cache.lfu.pop_key(self.index).unwrap();
+                    return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
                 }
-                if let Some(item) = cache.map.get_mut(&r.el.0) {
-                    item.frequency_down_count = 0;
-                }
-                cache.lfu.metrics.timeout += 1;
-                cache.lfu.size -= r.el.1.size();
-                let k = cache.lfu.pop_key(self.index).unwrap();
-                return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
             }
             self.index += 1;
         }
@@ -427,13 +426,12 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                 .slot
                 .get(self.cache.lfu.arr[self.index].head())
             {
-                if r.el.1.timeout() > self.now {
-                    return None;
+                if r.el.1.timeout() < self.now {
+                    self.cache.map.remove(&r.el.0);
+                    self.cache.lfu.metrics.timeout += 1;
+                    self.cache.lfu.size -= r.el.1.size();
+                    return self.cache.lfu.pop(self.index);
                 }
-                self.cache.map.remove(&r.el.0);
-                self.cache.lfu.metrics.timeout += 1;
-                self.cache.lfu.size -= r.el.1.size();
-                return self.cache.lfu.pop(self.index);
             }
             self.index += 1;
         }
@@ -652,29 +650,36 @@ mod test_mod {
     #[test]
     pub fn test() {
         let mut cache: Cache<usize, R1> = Default::default();
-        cache.put(1, R1(1, 1000, 0));
-        cache.put(2, R1(2, 2000, 0));
-        cache.put(3, R1(3, 3000, 0));
-        cache.put(4, R1(4, 3000, 0));
+        let mut time: u64 = 0;
+        let mut f = || {
+            time += 1;
+            time
+        };
+        cache.put(1, R1(1, 1000, f()));
+        cache.put(2, R1(2, 2000, f()));
+        cache.put(3, R1(3, 3000, f()));
+        cache.put(4, R1(4, 3000, f()));
         assert(&cache, vec![1, 2, 3, 4]);
-        assert_eq!(cache.get(&1), Some(&R1(1, 1000, 0)));
-        assert_eq!(cache.get(&2), Some(&R1(2, 2000, 0)));
+        assert_eq!(cache.get(&1), Some(&R1(1, 1000, 1)));
+        assert_eq!(cache.get(&2), Some(&R1(2, 2000, 2)));
         assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(0));
         assert_eq!(cache.get_frequency(&5), FrequencyState::None);
         cache.take(&3);
         assert(&cache, vec![1, 2, 4]);
         assert_eq!(cache.get_frequency(&3), FrequencyState::TakenAway);
-        cache.put(3, R1(3, 3000, 0));
+        cache.put(3, R1(3, 3000, f()));
         assert(&cache, vec![1, 2, 4, 3]);
         assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(1));
         {
-            let r = cache.active_mut(&1);
-            assert_eq!(r.unwrap(), &R1(1, 1000, 0));
+            let mut r = cache.active_mut(&1);
+            r.as_mut().unwrap().2 = f();
+            assert_eq!(r.unwrap(), &R1(1, 1000, 6));
         };
         assert(&cache, vec![2, 4, 3, 1]);
-        cache.put(3, R1(3, 3100, 0));
+        cache.put(3, R1(3, 3100, f()));
         assert(&cache, vec![2, 4, 1, 3]);
-        cache.active_mut(&4);
+        let mut r = cache.active_mut(&4);
+        r.as_mut().unwrap().2 = f();
         assert(&cache, vec![2, 1, 4, 3]);
         assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(0));
         assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(1));
@@ -683,12 +688,13 @@ mod test_mod {
         // 测试移除后，在过滤器命中的情况下，数据频次应为1
         cache.remove(&2);
         assert_eq!(cache.get_frequency(&2), FrequencyState::None);
-        cache.put(2, R1(2, 2100, 0));
+        cache.put(2, R1(2, 2100, f()));
         assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(1));
         assert(&cache, vec![1, 4, 2, 3]);
         // 测试最大频次为15
         for i in 2..33 {
-            cache.active_mut(&2);
+            let mut r = cache.active_mut(&2);
+            r.as_mut().unwrap().2 = f();
             assert_eq!(
                 cache.get_frequency(&2),
                 FrequencyState::Frequency(if i > 15 { 15 } else { i })
@@ -699,14 +705,18 @@ mod test_mod {
         assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(15));
         assert_eq!(cache.get_frequency(&3), FrequencyState::Frequency(2));
         assert_eq!(cache.get_frequency(&4), FrequencyState::Frequency(1));
-        cache.put(5, R1(5, 5000, 0));
-        println!("1---------");
+        cache.put(5, R1(5, 5000, f()));
+        println!("---------, 1:{:?}", cache.get(&1));
+        println!("---------, 2:{:?}", cache.get(&2));
+        println!("---------, 3:{:?}", cache.get(&3));
+        println!("---------, 4:{:?}", cache.get(&4));
+        println!("---------, 5:{:?}", cache.get(&5));
         assert_eq!(cache.get_frequency(&5), FrequencyState::Frequency(0));
         assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(1));
 
         // 测试频降后的数据正确性
         assert_eq!(cache.take(&2).unwrap().0, 2);
-        cache.put(2, R1(2, 2200, 0));
+        cache.put(2, R1(2, 2200, f()));
         println!("2---------");
         assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(0));
         assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(8));
@@ -720,17 +730,18 @@ mod test_mod {
             cache.len(),
             cache.count()
         );
-        for i in cache.timeout_ref_collect(0, 1000) {
+        for i in cache.timeout_ref_collect(0, 8) {
             println!("timeout_ref_collect, {}", i.0);
         }
         for i in cache.capacity_ref_collect(9000) {
             println!("capacity_ref_collect, {}", i.0);
         }
         assert_eq!(cache.get_frequency(&5), FrequencyState::Garbaged);
-        cache.active_mut(&5);
-        assert_eq!(cache.get_frequency(&1), FrequencyState::Garbaged);
-        cache.collect(1).unwrap();
-        assert(&cache, vec![4, 3, 5, 2]);
+        let mut r = cache.active_mut(&5);
+        r.as_mut().unwrap().2 = f();
+        assert_eq!(cache.get_frequency(&3), FrequencyState::Garbaged);
+        cache.collect(3).unwrap();
+        assert(&cache, vec![1, 4, 5, 2]);
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
