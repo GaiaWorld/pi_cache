@@ -100,6 +100,14 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
+    /// adjust size
+    pub fn adjust_size(&mut self, size: isize) {
+        if size > 0 {
+            self.lfu.metrics.size_incr += size as usize;
+        }else{
+            self.lfu.metrics.size_decr += -size as usize;
+        }
+    }
     /// 拿走的数据， 如果拿到了数据，就必须保证会调用put还回来
     pub fn take(&mut self, k: &K) -> Option<V> {
         match self.map.entry(k.clone()) {
@@ -200,7 +208,8 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 // 垃圾回收状态，重新添加进队列1的尾部
                 self.lfu.arr[1].push_key_back(r.key, &mut self.lfu.slot);
                 let v = unsafe { &mut (self.lfu.slot.get_unchecked_mut(r.key).el.1) };
-                self.lfu.size += v.size();
+                self.lfu.metrics.len_incr += 1;
+                self.lfu.metrics.size_incr += v.size();
                 Some(v)
             };
         }
@@ -210,7 +219,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 移走
     pub fn remove(&mut self, k: &K) -> Option<V> {
         if let Some(r) = self.map.remove(k) {
-            // 已经被拿走，不可移除
+            // 已经被拿走，则只移除频率
             if r.key.is_null() {
                 return None;
             }
@@ -243,7 +252,8 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             self.lfu.arr[i].repair(prev, next, &mut self.lfu.slot);
             self.lfu.metrics.garbage += 1;
             let r = unsafe { &(self.lfu.slot.get_unchecked(r.key).el) };
-            self.lfu.size -= r.1.size();
+            self.lfu.metrics.len_incr += 1;
+            self.lfu.metrics.size_decr += r.1.size();
             return Some(&r.1);
         }
         None
@@ -263,17 +273,17 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             _ => None,
         }
     }
-    /// 全部数量，包括被拿走的数据
-    pub fn len(&self) -> usize {
+    /// 全部的频率信息数量，包括被拿走的数据
+    pub fn frequency_len(&self) -> usize {
         self.map.len()
     }
     /// 当前数量，被缓存的数据数量
-    pub fn count(&self) -> usize {
-        self.lfu.slot.len()
+    pub fn len(&self) -> usize {
+        self.lfu.metrics.len_incr - self.lfu.metrics.len_decr
     }
     /// 当前缓存的数据总大小
     pub fn size(&self) -> usize {
-        self.lfu.size
+        self.lfu.metrics.size_incr - self.lfu.metrics.size_decr
     }
     /// 获得当前的统计
     pub fn metrics(&self) -> Metrics {
@@ -351,17 +361,17 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let cache = unsafe { &mut *self.cache };
-        if cache.lfu.size <= self.capacity {
+        if cache.size() <= self.capacity {
             return None;
         }
         while self.index < cache.lfu.arr.len() {
             if let Some(r) = cache.lfu.slot.get(cache.lfu.arr[self.index].head()) {
                 if r.el.1.timeout() < self.now {
-                    if let Some(item) = cache.map.get_mut(&r.el.0) {
-                        item.frequency_down_count = 0;
-                    }
+                    let item = cache.map.get_mut(&r.el.0).unwrap();
+                    item.frequency_down_count = 0;
                     cache.lfu.metrics.timeout += 1;
-                    cache.lfu.size -= r.el.1.size();
+                    cache.lfu.metrics.len_decr += 1;
+                    cache.lfu.metrics.size_decr += r.el.1.size();
                     let k = cache.lfu.pop_key(self.index).unwrap();
                     return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
                 }
@@ -385,17 +395,17 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityRefIter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let cache = unsafe { &mut *self.cache };
-        if cache.lfu.size <= self.capacity {
+        if cache.size() <= self.capacity {
             return None;
         }
         while self.index < cache.lfu.arr.len() {
             if let Some(k) = cache.lfu.pop_key(self.index) {
                 let r = unsafe { &(cache.lfu.slot.get_unchecked(k).el) };
-                if let Some(item) = cache.map.get_mut(&r.0) {
-                    item.frequency_down_count = 0;
-                }
+                let item = cache.map.get_mut(&r.0).unwrap();
+                item.frequency_down_count = 0;
                 cache.lfu.metrics.evict += 1;
-                cache.lfu.size -= r.1.size();
+                cache.lfu.metrics.len_decr += 1;
+                cache.lfu.metrics.size_decr += r.1.size();
                 return Some(r);
             }
             self.index += 1;
@@ -416,7 +426,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cache.lfu.size <= self.capacity {
+        if self.cache.size() <= self.capacity {
             return None;
         }
         while self.index < self.cache.lfu.arr.len() {
@@ -429,7 +439,8 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                 if r.el.1.timeout() < self.now {
                     self.cache.map.remove(&r.el.0);
                     self.cache.lfu.metrics.timeout += 1;
-                    self.cache.lfu.size -= r.el.1.size();
+                    self.cache.lfu.metrics.len_decr += 1;
+                    self.cache.lfu.metrics.size_decr += r.el.1.size();
                     return self.cache.lfu.pop(self.index);
                 }
             }
@@ -450,14 +461,15 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cache.lfu.size <= self.capacity {
+        if self.cache.size() <= self.capacity {
             return None;
         }
         while self.index < self.cache.lfu.arr.len() {
             if let Some(r) = self.cache.lfu.pop(self.index) {
                 self.cache.map.remove(&r.0);
                 self.cache.lfu.metrics.evict += 1;
-                self.cache.lfu.size -= r.1.size();
+                self.cache.lfu.metrics.len_decr += 1;
+                self.cache.lfu.metrics.size_decr += r.1.size();
                 return Some(r);
             }
             self.index += 1;
@@ -503,6 +515,14 @@ pub enum FrequencyState {
 /// 统计数据
 #[derive(Clone, Default, Debug)]
 pub struct Metrics {
+    /// 数量增加次数
+    pub len_incr: usize,
+    /// 数量减少次数
+    pub len_decr: usize,
+    /// 大小增加次数
+    pub size_incr: usize,
+    /// 大小减少次数
+    pub size_decr: usize,
     /// 命中次数
     pub hit: usize,
     /// 未命中次数
@@ -533,8 +553,6 @@ struct Lfu<K: Eq + Hash + Clone, V: Data> {
     arr: [Deque<DefaultKey>; 5],
     /// SlotMap
     slot: Slot<DefaultKey, (K, V)>,
-    /// 数据的总大小
-    size: usize,
     /// 统计数据
     metrics: Metrics,
     /// 频降率：放入次数/总数量，默认为8
@@ -549,7 +567,6 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
         Self {
             arr: Default::default(),
             slot: Default::default(),
-            size: 0,
             frequency_down_rate,
             metrics: Default::default(),
             frequency_down_count: 1,
@@ -559,12 +576,14 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
     /// 删除数据
     fn delete(&mut self, i: usize, k: DefaultKey) -> Option<V> {
         let v = unsafe { self.arr[i].remove(k, &mut self.slot).unwrap_unchecked().1 };
-        self.size -= v.size();
+        self.metrics.len_decr += 1;
+        self.metrics.size_decr += v.size();
         Some(v)
     }
     /// 插入数据
     fn insert(&mut self, i: usize, k: K, v: V) -> DefaultKey {
-        self.size += v.size();
+        self.metrics.len_incr += 1;
+        self.metrics.size_incr += v.size();
         self.arr[i].push_back((k, v), &mut self.slot)
     }
     /// 频降
@@ -631,6 +650,15 @@ impl Item {
 
 #[cfg(test)]
 mod test_mod {
+
+    extern crate pcg_rand;
+    extern crate rand_core;
+
+    use std::{
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use self::rand_core::{RngCore, SeedableRng};
     use crate::*;
 
     #[derive(Debug, Eq, PartialEq)]
@@ -725,10 +753,9 @@ mod test_mod {
         assert_eq!(cache.get_frequency(&5), FrequencyState::Frequency(0));
         assert(&cache, vec![5, 1, 4, 3, 2]);
         println!(
-            "cache size:{}, len:{}, count:{}",
+            "cache size:{}, len:{}",
             cache.size(),
             cache.len(),
-            cache.count()
         );
         for i in cache.timeout_ref_collect(0, 8) {
             println!("timeout_ref_collect, {}", i.0);
@@ -742,12 +769,109 @@ mod test_mod {
         assert_eq!(cache.get_frequency(&3), FrequencyState::Garbaged);
         cache.collect(3).unwrap();
         assert(&cache, vec![1, 4, 5, 2]);
+        cache.put(3, R1(3, 3330, f()));
+        assert(&cache, vec![1, 4, 5, 3, 2]);
+
+        for i in 6..100 {
+            cache.put(i, R1(i, i*1000, f()));
+        }
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        println!("---------------seed:{:?}", seed);
+        let mut rng = pcg_rand::Pcg32::seed_from_u64(seed);
+        let mut vec = vec![];
+        let mut kvec = vec![];
+        for _ in 1..10000 {
+            if cache.len() > 0 {
+                let t = (rng.next_u32() % cache.len() as u32) as usize;
+                if t%2 == 0 {
+                    let k = key(&cache, t);
+                    //println!("---------------t1:{:?}, k:{:?}", t, k);
+                    let r = cache.take(&k).unwrap();
+                    vec.push(r);
+                }else{
+                    for r in cache.capacity_ref_collect(0) {
+                        //println!("---------------t2:{:?}, k:{:?}", t, r.0);
+                        kvec.push(r.0);
+                        break
+                    }
+                }
+                check(&cache);
+            }
+            let mut i = (rng.next_u32() % (vec.len() + 5) as u32) as usize;
+            let mut j = (rng.next_u32() % (vec.len() + 5) as u32) as usize;
+            if i > j {
+                j = replace(&mut i, j);
+            }
+            
+            if i%2 == 0 {
+                if i >= vec.len() {
+                    continue;
+                }
+                if j >= vec.len() {
+                    j = vec.len();
+                }
+                //println!("---------------add1, i:{:?}, len:{:?}, vec_len:{:?}", i, j, vec.len());
+                for _ in i..j {
+                    let mut r = vec.remove(i);
+                    r.2 = f();
+                    cache.put(r.0, r);
+                    check(&cache);
+                }
+            }else{
+                if i >= kvec.len() {
+                    continue;
+                }
+                if j >= kvec.len() {
+                    j = kvec.len();
+                }
+                //println!("---------------add2, i:{:?}, len:{:?}, vec_len:{:?}", i, j, kvec.len());
+                for _ in i..j {
+                    let k = kvec.remove(i);
+                    let mut r = cache.collect(k).unwrap();
+                    r.2 = f();
+                    cache.put(r.0, r);
+                    check(&cache);
+                }
+            }
+        }
+    }
+    fn key(c: &Cache<usize, R1>, mut index: usize) -> usize {
+        for i in c.iter() {
+            if index == 0 {
+                return i.0
+            }
+            index -= 1;
+        }
+        0
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
-        for r in c.iter() {
-            assert_eq!(r.0, vec[i]);
-            i += 1;
+        //println!("assert, vec:{:?}", vec);
+        for n in 0..5 {
+            for r in c.lfu.arr[n].iter(&c.lfu.slot) {
+                assert_eq!(r.0, vec[i]);
+                if let FrequencyState::Frequency(x) = c.get_frequency(&r.0) {
+                    //println!("assert n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0);
+                    assert_eq!(u32::BITS - (x as u32).leading_zeros(), n as u32);
+                }else{
+                    //panic!("invalid: n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0)
+                }
+                
+                i += 1;
+            }
+        }
+    }
+    fn check(c: &Cache<usize, R1>) {
+        //println!("------------check");
+        for n in 0..5 {
+            for r in c.lfu.arr[n].iter(&c.lfu.slot) {
+                if let FrequencyState::Frequency(x) = c.get_frequency(&r.0) {
+                    //println!("assert n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0);
+                    assert_eq!(u32::BITS - (x as u32).leading_zeros(), n as u32);
+                }else{
+                    panic!("invalid: n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0)
+                }
+            }
         }
     }
 }

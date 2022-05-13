@@ -1,6 +1,6 @@
 [package]
 name = "pi_cache"
-version = "0.2.5"
+version = "0.3.0"
 authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"
@@ -17,3 +17,7 @@ probabilistic-collections = "0.7"
 slotmap = "1.0"
 pi_slot_deque = "0.1"
 pi_hash = "0.1"
+
+[dev-dependencies]
+pcg_rand = "0.13"
+rand_core = "0.6"
