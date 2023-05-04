@@ -76,7 +76,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 FrequencyState::Garbaged
             } else {
                 FrequencyState::Frequency(
-                    (r.frequency >> (self.lfu.frequency_down_count - r.frequency_down_count)) as u8,
+					r.shr(self.lfu.frequency_down_count) as u8
                 )
             };
         }
@@ -103,9 +103,9 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// adjust size
     pub fn adjust_size(&mut self, size: isize) {
         if size > 0 {
-            self.lfu.metrics.size_incr += size as usize;
+            self.lfu.metrics.size_incr += size as u64;
         }else{
-            self.lfu.metrics.size_decr += -size as usize;
+            self.lfu.metrics.size_decr += -size as u64;
         }
     }
     /// 拿走的数据， 如果拿到了数据，就必须保证会调用put还回来
@@ -209,7 +209,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 self.lfu.arr[1].push_key_back(r.key, &mut self.lfu.slot);
                 let v = unsafe { &mut (self.lfu.slot.get_unchecked_mut(r.key).el.1) };
                 self.lfu.metrics.len_incr += 1;
-                self.lfu.metrics.size_incr += v.size();
+                self.lfu.metrics.size_incr += v.size() as u64;
                 Some(v)
             };
         }
@@ -253,7 +253,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             self.lfu.metrics.garbage += 1;
             let r = unsafe { &(self.lfu.slot.get_unchecked(r.key).el) };
             self.lfu.metrics.len_incr += 1;
-            self.lfu.metrics.size_decr += r.1.size();
+            self.lfu.metrics.size_decr += r.1.size() as u64;
             return Some(&r.1);
         }
         None
@@ -283,7 +283,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     }
     /// 当前缓存的数据总大小
     pub fn size(&self) -> usize {
-        self.lfu.metrics.size_incr - self.lfu.metrics.size_decr
+        (self.lfu.metrics.size_incr - self.lfu.metrics.size_decr) as usize
     }
     /// 获得当前的统计
     pub fn metrics(&self) -> Metrics {
@@ -371,7 +371,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
                     item.frequency_down_count = 0;
                     cache.lfu.metrics.timeout += 1;
                     cache.lfu.metrics.len_decr += 1;
-                    cache.lfu.metrics.size_decr += r.el.1.size();
+                    cache.lfu.metrics.size_decr += r.el.1.size() as u64;
                     let k = cache.lfu.pop_key(self.index).unwrap();
                     return Some(unsafe { &(cache.lfu.slot.get_unchecked(k).el) });
                 }
@@ -405,7 +405,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityRefIter<'a, K, V> {
                 item.frequency_down_count = 0;
                 cache.lfu.metrics.evict += 1;
                 cache.lfu.metrics.len_decr += 1;
-                cache.lfu.metrics.size_decr += r.1.size();
+                cache.lfu.metrics.size_decr += r.1.size() as u64;
                 return Some(r);
             }
             self.index += 1;
@@ -440,7 +440,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
                     self.cache.map.remove(&r.el.0);
                     self.cache.lfu.metrics.timeout += 1;
                     self.cache.lfu.metrics.len_decr += 1;
-                    self.cache.lfu.metrics.size_decr += r.el.1.size();
+                    self.cache.lfu.metrics.size_decr += r.el.1.size() as u64;
                     return self.cache.lfu.pop(self.index);
                 }
             }
@@ -469,7 +469,7 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
                 self.cache.map.remove(&r.0);
                 self.cache.lfu.metrics.evict += 1;
                 self.cache.lfu.metrics.len_decr += 1;
-                self.cache.lfu.metrics.size_decr += r.1.size();
+                self.cache.lfu.metrics.size_decr += r.1.size() as u64;
                 return Some(r);
             }
             self.index += 1;
@@ -520,9 +520,9 @@ pub struct Metrics {
     /// 数量减少次数
     pub len_decr: usize,
     /// 大小增加次数
-    pub size_incr: usize,
+    pub size_incr: u64,
     /// 大小减少次数
-    pub size_decr: usize,
+    pub size_decr: u64,
     /// 命中次数
     pub hit: usize,
     /// 未命中次数
@@ -577,13 +577,13 @@ impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
     fn delete(&mut self, i: usize, k: DefaultKey) -> Option<V> {
         let v = unsafe { self.arr[i].remove(k, &mut self.slot).unwrap_unchecked().1 };
         self.metrics.len_decr += 1;
-        self.metrics.size_decr += v.size();
+        self.metrics.size_decr += v.size() as u64;
         Some(v)
     }
     /// 插入数据
     fn insert(&mut self, i: usize, k: K, v: V) -> DefaultKey {
         self.metrics.len_incr += 1;
-        self.metrics.size_incr += v.size();
+        self.metrics.size_incr += v.size() as u64;
         self.arr[i].push_back((k, v), &mut self.slot)
     }
     /// 频降
@@ -620,17 +620,27 @@ struct Item {
     frequency_down_count: u32,
 }
 impl Item {
+	#[inline]
+    fn shr(&self, frequency_down_count: u32) -> u32 {
+		let count = frequency_down_count - self.frequency_down_count;
+		if count < 4 {
+			self.frequency >> count
+		} else {
+			0
+		}
+    }
+
     /// 获得频次所在的位置
     #[inline]
     fn get(&self, frequency_down_count: u32) -> usize {
-        let i = self.frequency >> (frequency_down_count - self.frequency_down_count);
+        let i = self.shr(frequency_down_count);
         (u32::BITS - i.leading_zeros()) as usize
     }
     /// 增加频次，设置当前频降数，并获得新旧频次所在的位置
     #[inline]
     fn put(&mut self, frequency_down_count: u32) -> (usize, usize) {
         let old = if frequency_down_count > self.frequency_down_count {
-            let old = self.frequency >> (frequency_down_count - self.frequency_down_count);
+            let old = self.shr(frequency_down_count);
             self.frequency_down_count = frequency_down_count;
             old
         } else {
