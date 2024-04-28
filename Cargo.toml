@@ -16,6 +16,7 @@ log = "0.4"
 slotmap = "1.0"
 pi_slot_deque = "0.2"
 pi_hash = "0.1"
+pi_print_any = "0.1"
 
 [dev-dependencies]
 pcg_rand = "0.13"
