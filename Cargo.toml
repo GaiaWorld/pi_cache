@@ -1,6 +1,6 @@
 [package]
 name = "pi_cache"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"
@@ -13,9 +13,8 @@ repository = "https://github.com/GaiaWorld/pi_cache"
 
 [dependencies]
 log = "0.4"
-probabilistic-collections = "0.7"
 slotmap = "1.0"
-pi_slot_deque = "0.1"
+pi_slot_deque = "0.2"
 pi_hash = "0.1"
 
 [dev-dependencies]

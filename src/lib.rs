@@ -13,7 +13,6 @@
 
 use pi_hash::XHashMap;
 use pi_slot_deque::{Deque, Iter as SlotIter, Slot};
-use probabilistic_collections::cuckoo::CuckooFilter;
 use slotmap::{DefaultKey, Key};
 use std::collections::hash_map;
 use std::hash::Hash;
@@ -33,20 +32,20 @@ pub struct Cache<K: Eq + Hash + Clone, V: Data> {
     lfu: Lfu<K, V>,
     /// 数据条目
     map: XHashMap<K, Item>,
-    /// 首次数据的bloom，判断不在缓存的数据是否被调用过， 一般指定大小，比如1024.
-    filter: CuckooFilter<K>,
+    // /// 首次数据的bloom，判断不在缓存的数据是否被调用过， 一般指定大小，比如1024.
+    // filter: CuckooFilter<K>,
 }
 
 impl<K: Eq + Hash + Clone, V: Data> Default for Cache<K, V> {
     fn default() -> Self {
-        Self::with_config(0, WINDOW_SIZE, FREQUENCY_DOWN_RATE)
+        Self::with_config(0, /** WINDOW_SIZE,*/ FREQUENCY_DOWN_RATE)
     }
 }
 impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 用初始表大小，CuckooFilter窗口大小，整理率创建Cache
     pub fn with_config(
         map_capacity: usize,
-        cuckoo_filter_window_size: usize,
+        // cuckoo_filter_window_size: usize,
         frequency_down_rate: usize,
     ) -> Self {
         let map = if map_capacity == 0 {
@@ -57,7 +56,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         Self {
             lfu: Lfu::new(frequency_down_rate),
             map,
-            filter: CuckooFilter::from_entries_per_index(cuckoo_filter_window_size, 0.01, 8),
+            // filter: CuckooFilter::from_entries_per_index(cuckoo_filter_window_size, 0.01, 8),
         }
     }
     /// 判断是否有指定键的数据
@@ -158,22 +157,22 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             }
             hash_map::Entry::Vacant(e) => {
                 // 如果在概率过滤器中命中
-                let frequency = if self.filter.contains(e.key()) {
-                    self.lfu.metrics.insert2 += 1;
-                    1
-                } else {
+                // let frequency = if self.filter.contains(e.key()) {
+                //     self.lfu.metrics.insert2 += 1;
+                //     1
+                // } else {
                     self.lfu.metrics.insert1 += 1;
-                    if self.filter.is_nearly_full() {
-                        self.filter.clear();
-                    }
-                    self.filter.insert(&e.key());
-                    0
-                };
+                    // if self.filter.is_nearly_full() {
+                    //     self.filter.clear();
+                    // }
+                    // self.filter.insert(&e.key());
+                    // 0
+                // };
                 // 插入新数据
-                let key = self.lfu.insert(frequency as usize, k, v);
+                let key = self.lfu.insert(0, k, v);
                 e.insert(Item {
                     key,
-                    frequency,
+                    frequency: 0,
                     frequency_down_count: self.lfu.frequency_down_count,
                 });
                 None
@@ -717,10 +716,10 @@ mod test_mod {
         cache.remove(&2);
         assert_eq!(cache.get_frequency(&2), FrequencyState::None);
         cache.put(2, R1(2, 2100, f()));
-        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(1));
-        assert(&cache, vec![1, 4, 2, 3]);
+        assert_eq!(cache.get_frequency(&2), FrequencyState::Frequency(0));
+        assert(&cache, vec![2, 1, 4, 3]);
         // 测试最大频次为15
-        for i in 2..33 {
+        for i in 1..32 {
             let mut r = cache.active_mut(&2);
             r.as_mut().unwrap().2 = f();
             assert_eq!(
@@ -770,7 +769,7 @@ mod test_mod {
         cache.collect(3).unwrap();
         assert(&cache, vec![1, 4, 5, 2]);
         cache.put(3, R1(3, 3330, f()));
-        assert(&cache, vec![1, 4, 5, 3, 2]);
+        assert(&cache, vec![1, 4, 3, 5, 2]);
 
         for i in 6..100 {
             cache.put(i, R1(i, i*1000, f()));
@@ -846,7 +845,7 @@ mod test_mod {
     }
     fn assert(c: &Cache<usize, R1>, vec: Vec<usize>) {
         let mut i = 0;
-        //println!("assert, vec:{:?}", vec);
+        println!("assert, vec:{:?}", vec);
         for n in 0..5 {
             for r in c.lfu.arr[n].iter(&c.lfu.slot) {
                 assert_eq!(r.0, vec[i]);
