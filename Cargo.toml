@@ -1,6 +1,6 @@
 [package]
 name = "pi_cache"
-version = "0.4.0"
+version = "0.4.3"
 authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"
@@ -21,3 +21,5 @@ pi_print_any = "0.1"
 [dev-dependencies]
 pcg_rand = "0.13"
 rand_core = "0.6"
+parking_lot = "0.12"
+TinyUFO = "0.1"
