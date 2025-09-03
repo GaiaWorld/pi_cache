@@ -12,8 +12,9 @@
 //!
 
 use pi_hash::XHashMap;
+use pi_null::Null;
 use pi_slot_deque::{Deque, Iter as SlotIter, Slot};
-use slotmap::{DefaultKey, Key};
+use pi_slotmap::{DefaultKey, Key};
 use std::collections::hash_map;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -38,7 +39,7 @@ pub struct Cache<K: Eq + Hash + Clone, V: Data> {
 
 impl<K: Eq + Hash + Clone, V: Data> Default for Cache<K, V> {
     fn default() -> Self {
-        Self::with_config(0, /** WINDOW_SIZE,*/ FREQUENCY_DOWN_RATE)
+        Self::with_config(0, /*WINDOW_SIZE*/ FREQUENCY_DOWN_RATE)
     }
 }
 impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
@@ -74,14 +75,12 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             } else if r.frequency_down_count == 0 {
                 FrequencyState::Garbaged
             } else {
-                FrequencyState::Frequency(
-					r.shr(self.lfu.frequency_down_count) as u8
-                )
+                FrequencyState::Frequency(r.shr(self.lfu.frequency_down_count) as u8)
             };
         }
         FrequencyState::None
     }
-    /// 获得指定键的数据
+    /// 获得指定键的数据  获取键对应的数据的不可变引用
     pub fn get(&self, k: &K) -> Option<&V> {
         if let Some(r) = self.map.get(k) {
             if !r.key.is_null() {
@@ -90,7 +89,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// GetMut by key
+    /// GetMut by key 获取键对应的数据的可变引用
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get(k) {
             if !r.key.is_null() {
@@ -99,11 +98,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// adjust size
+    /// adjust size  调整缓存总大小的统计，正数增加，负数减少
     pub fn adjust_size(&mut self, size: isize) {
         if size > 0 {
             self.lfu.metrics.size_incr += size as u64;
-        }else{
+        } else {
             self.lfu.metrics.size_decr += -size as u64;
         }
     }
@@ -161,12 +160,12 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                 //     self.lfu.metrics.insert2 += 1;
                 //     1
                 // } else {
-                    self.lfu.metrics.insert1 += 1;
-                    // if self.filter.is_nearly_full() {
-                    //     self.filter.clear();
-                    // }
-                    // self.filter.insert(&e.key());
-                    // 0
+                self.lfu.metrics.insert1 += 1;
+                // if self.filter.is_nearly_full() {
+                //     self.filter.clear();
+                // }
+                // self.filter.insert(&e.key());
+                // 0
                 // };
                 // 插入新数据
                 let key = self.lfu.insert(0, k, v);
@@ -179,6 +178,43 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             }
         }
     }
+
+    /// 带频次的数据插入  不降频
+    pub fn put_with_frequency(&mut self, k: K, v: V, frequency: u32) -> Option<V> {
+        match self.map.entry(k.clone()) {
+            hash_map::Entry::Occupied(mut e) => {
+                let r = e.get_mut();
+                // 获取新旧位置
+                let (i, old_i) = r.put_with_frequency(self.lfu.frequency_down_count, frequency);
+                if !r.key.is_null() {
+                    self.lfu.metrics.replace += 1;
+                    // 插入新数据
+                    let key = self.lfu.insert(i, k, v);
+                    // 记录新的key，及删除旧数据
+                    return self.lfu.delete(old_i, replace(&mut r.key, key));
+                } else {
+                    self.lfu.metrics.put += 1;
+                    // 插入新数据，记录新的key
+                    r.key = self.lfu.insert(i, k, v);
+                    None
+                }
+            }
+            hash_map::Entry::Vacant(e) => {
+                self.lfu.metrics.insert1 += 1;
+                // 计算指定频次插入位置
+                let i = (u32::BITS - frequency.leading_zeros()) as usize;
+                // 插入新数据
+                let key = self.lfu.insert(i, k, v);
+                e.insert(Item {
+                    key,
+                    frequency,
+                    frequency_down_count: self.lfu.frequency_down_count,
+                });
+                None
+            }
+        }
+    }
+
     /// 激活并获取可写应用，会增加频次和最后使用时间，等于拿走并立即还回来，但性能更高
     pub fn active_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get_mut(k) {
@@ -332,6 +368,36 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             capacity,
         }
     }
+
+    /// 获取所有有效项的核心元数据
+    pub fn items_metas(&self) -> Vec<ItemMeta<K>> {
+        let mut metas: Vec<ItemMeta<K>> = Vec::new();
+        for r in self.iter() {
+            match self.get_frequency(&r.0) {
+                FrequencyState::Frequency(f) => metas.push(ItemMeta {
+                    key: r.0.clone(),
+                    frequency: f,
+                    size: r.1.size(),
+                    timeout: r.1.timeout(),
+                }),
+                _ => (),
+            }
+        }
+        metas
+    }
+}
+
+/// 缓存项的完整元数据（用于序列化和重建）
+#[derive(Debug)]
+pub struct ItemMeta<K> {
+    /// 键值
+    pub key: K,
+    /// 当前实际频次
+    pub frequency: u8,
+    /// 数据占用内存大小
+    pub size: usize,
+    /// 数据超时时间戳（0表示永不过期）
+    pub timeout: u64,
 }
 
 /// 数据，放入数据表的数据必须实现该trait
@@ -561,6 +627,7 @@ struct Lfu<K: Eq + Hash + Clone, V: Data> {
     /// 这个频降周期的放入次数，
     put_count: usize,
 }
+
 impl<K: Eq + Hash + Clone, V: Data> Lfu<K, V> {
     pub fn new(frequency_down_rate: usize) -> Self {
         Self {
@@ -619,14 +686,14 @@ struct Item {
     frequency_down_count: u32,
 }
 impl Item {
-	#[inline]
+    #[inline]
     fn shr(&self, frequency_down_count: u32) -> u32 {
-		let count = frequency_down_count - self.frequency_down_count;
-		if count < 4 {
-			self.frequency >> count
-		} else {
-			0
-		}
+        let count = frequency_down_count - self.frequency_down_count;
+        if count < 4 {
+            self.frequency >> count
+        } else {
+            0
+        }
     }
 
     /// 获得频次所在的位置
@@ -655,6 +722,31 @@ impl Item {
             (u32::BITS - old.leading_zeros()) as usize,
         )
     }
+
+    /// 增加频次，设置当前频降数，并获得新旧频次所在的位置
+    #[inline]
+    fn put_with_frequency(&mut self, frequency_down_count: u32, frequency: u32) -> (usize, usize) {
+        let old = if frequency_down_count > self.frequency_down_count {
+            let old = self.shr(frequency_down_count);
+            self.frequency_down_count = frequency_down_count;
+            old
+        } else {
+            self.frequency
+        };
+
+        if old >= FREQUENCY_MAX {
+            self.frequency = FREQUENCY_MAX;
+        } else {
+            self.frequency = old + frequency;
+            if self.frequency >= FREQUENCY_MAX {
+                self.frequency = FREQUENCY_MAX;
+            }
+        }
+        (
+            (u32::BITS - self.frequency.leading_zeros()) as usize,
+            (u32::BITS - old.leading_zeros()) as usize,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -663,9 +755,7 @@ mod test_mod {
     extern crate pcg_rand;
     extern crate rand_core;
 
-    use std::{
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use self::rand_core::{RngCore, SeedableRng};
     use crate::*;
@@ -692,10 +782,15 @@ mod test_mod {
             time += 1;
             time
         };
+
         cache.put(1, R1(1, 1000, f()));
         cache.put(2, R1(2, 2000, f()));
         cache.put(3, R1(3, 3000, f()));
         cache.put(4, R1(4, 3000, f()));
+        // for r in cache.capacity_collect(7000) {
+        //     println!("result = {},r1 = {}", r.0, r.1 .0);
+        // }
+
         assert(&cache, vec![1, 2, 3, 4]);
         assert_eq!(cache.get(&1), Some(&R1(1, 1000, 1)));
         assert_eq!(cache.get(&2), Some(&R1(2, 2000, 2)));
@@ -761,11 +856,7 @@ mod test_mod {
         assert_eq!(cache.get_frequency(&4), FrequencyState::Frequency(0));
         assert_eq!(cache.get_frequency(&5), FrequencyState::Frequency(0));
         assert(&cache, vec![5, 1, 4, 3, 2]);
-        println!(
-            "cache size:{}, len:{}",
-            cache.size(),
-            cache.len(),
-        );
+        println!("cache size:{}, len:{}", cache.size(), cache.len(),);
         for i in cache.timeout_ref_collect(0, 8) {
             println!("timeout_ref_collect, {}", i.0);
         }
@@ -782,9 +873,12 @@ mod test_mod {
         assert(&cache, vec![1, 4, 3, 5, 2]);
 
         for i in 6..100 {
-            cache.put(i, R1(i, i*1000, f()));
+            cache.put(i, R1(i, i * 1000, f()));
         }
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         println!("---------------seed:{:?}", seed);
         let mut rng = pcg_rand::Pcg32::seed_from_u64(seed);
         let mut vec = vec![];
@@ -792,16 +886,16 @@ mod test_mod {
         for _ in 1..10000 {
             if cache.len() > 0 {
                 let t = (rng.next_u32() % cache.len() as u32) as usize;
-                if t%2 == 0 {
+                if t % 2 == 0 {
                     let k = key(&cache, t);
                     //println!("---------------t1:{:?}, k:{:?}", t, k);
                     let r = cache.take(&k).unwrap();
                     vec.push(r);
-                }else{
+                } else {
                     for r in cache.capacity_ref_collect(0) {
                         //println!("---------------t2:{:?}, k:{:?}", t, r.0);
                         kvec.push(r.0);
-                        break
+                        break;
                     }
                 }
                 check(&cache);
@@ -811,8 +905,8 @@ mod test_mod {
             if i > j {
                 j = replace(&mut i, j);
             }
-            
-            if i%2 == 0 {
+
+            if i % 2 == 0 {
                 if i >= vec.len() {
                     continue;
                 }
@@ -826,7 +920,7 @@ mod test_mod {
                     cache.put(r.0, r);
                     check(&cache);
                 }
-            }else{
+            } else {
                 if i >= kvec.len() {
                     continue;
                 }
@@ -847,7 +941,7 @@ mod test_mod {
     fn key(c: &Cache<usize, R1>, mut index: usize) -> usize {
         for i in c.iter() {
             if index == 0 {
-                return i.0
+                return i.0;
             }
             index -= 1;
         }
@@ -862,10 +956,10 @@ mod test_mod {
                 if let FrequencyState::Frequency(x) = c.get_frequency(&r.0) {
                     //println!("assert n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0);
                     assert_eq!(u32::BITS - (x as u32).leading_zeros(), n as u32);
-                }else{
+                } else {
                     //panic!("invalid: n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0)
                 }
-                
+
                 i += 1;
             }
         }
@@ -877,10 +971,38 @@ mod test_mod {
                 if let FrequencyState::Frequency(x) = c.get_frequency(&r.0) {
                     //println!("assert n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0);
                     assert_eq!(u32::BITS - (x as u32).leading_zeros(), n as u32);
-                }else{
-                    panic!("invalid: n:{}, f:{:?}, k:{:?}", n, c.get_frequency(&r.0), r.0)
+                } else {
+                    panic!(
+                        "invalid: n:{}, f:{:?}, k:{:?}",
+                        n,
+                        c.get_frequency(&r.0),
+                        r.0
+                    )
                 }
             }
         }
+    }
+
+    #[test]
+    pub fn test_with_frequency() {
+        let mut cache: Cache<usize, R1> = Default::default();
+        let mut time: u64 = 0;
+        let mut f = || {
+            time += 1;
+            time
+        };
+
+        cache.put_with_frequency(1, R1(1, 1000, f()), 5);
+        cache.put(2, R1(2, 2000, f()));
+        cache.put(2, R1(2, 2000, f()));
+        cache.put(3, R1(3, 3000, f()));
+        cache.put(4, R1(4, 3000, f()));
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(5));
+        cache.put(1, R1(1, 1000, f()));
+        cache.put_with_frequency(1, R1(1, 1000, f()), 3);
+        assert_eq!(cache.get_frequency(&1), FrequencyState::Frequency(9));
+
+        let items_metas = cache.items_metas();
+        println!("==== items_metas {:?}", items_metas);
     }
 }
