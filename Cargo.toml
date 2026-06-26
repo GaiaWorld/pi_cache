@@ -1,6 +1,6 @@
 [package]
 name = "pi_cache"
-version = "0.4.4"
+version = "0.5.0"
 authors = ["zmax <zmax@gaia.world>"]
 edition = "2021"
 description = "Implementation of LFU-LRU cache"
@@ -13,8 +13,8 @@ repository = "https://github.com/GaiaWorld/pi_cache"
 
 [dependencies]
 log = "0.4"
-pi_slotmap = { version = "0.2", features = ["serde"] }
-pi_slot_deque = "0.3"
+pi_slotmap = { version = "0.3", features = ["serde"] }
+pi_slot_deque = "0.4"
 pi_hash = "0.1"
 pi_print_any = "0.1"
 pi_null = "0.1"
