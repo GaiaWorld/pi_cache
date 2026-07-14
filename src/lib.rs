@@ -1,15 +1,32 @@
-//! Cache缓存
-//! 基于LFU-LRU
-//! 预设数据访问频次最高为15， 然后按照访问频次0,1,2-3,4-7,8-15分成5段，每段为一个LRU，如果数据增加频次，则可能迁移到更高段的LRU上。
-//! 为了减少缓存击穿的情况，增加了一个CuckooFilter。
-//! 当数据放入时，首先查找频次表，获得原频次，
-//!     如果没有该键，则为首次放入，接着查找CuckooFilter，如果在，则频次提升为1，如果不在则记录到过滤器。
-//!     将数据放入到指定频次LRU中后，从0频次开始进行LRU淘汰，然后依次向更大频次的LRU进行淘汰。
-//!     当过滤器的接近满的时候，清空过滤器，重新开始。默认过滤器条目数量为1024.
-//! 频降率: 总放入次数/缓存总条目数，每当频降率达到阈值后，将所有频次减半，8降为4， 4降为2，2降为1， 将1频次LRU的数据放入0频次的LRU中。
-//! 为了记录被take拿走的数据频次，并且为了快速找到指定key所在的频次LRU，需要维护一个key的频次表。
-//! 支持垃圾标记和引用整理，将数据弹出频率队列，但保留数据本身，用collect方法真正移除。 如果在collect调用前，有其他的take和active_mut，则将数据重新放入频率队列。
+//! 基于分段 LFU-LRU 的内存缓存。
 //!
+//! `pi_cache` 同时使用访问频次和同频次内的访问顺序决定淘汰优先级。缓存将
+//! `0`、`1`、`2..=3`、`4..=7`、`8..=15` 五个频次范围分别维护为 LRU
+//! 队列；清理时先处理低频队列，同一队列中先处理最早进入队列的条目。
+//!
+//! # 频次与老化
+//!
+//! 新条目的频次为 `0`。调用 [`Cache::put`] 更新已有条目或调用
+//! [`Cache::active_mut`] 会提升频次，最大频次为 `15`。当会提升频次的操作数量
+//! 超过“当前槽位数乘以降频率”的近似阈值时，缓存执行一次全局降频：频次大致
+//! 减半，使近期热点能够逐渐替代历史热点。只读的 [`Cache::get`] 和
+//! [`Cache::get_mut`] 不会提升频次。
+//!
+//! # 条目状态
+//!
+//! 除正常缓存状态外，频次表还会记录两种中间状态：
+//!
+//! - [`FrequencyState::TakenAway`]：值已被 [`Cache::take`] 取走，但频次信息仍被
+//!   保留，调用方应使用 [`Cache::put`] 将值归还；
+//! - [`FrequencyState::Garbaged`]：值已移出频次队列但仍保存在槽位中，之后可用
+//!   [`Cache::collect`] 真正移除，或用 [`Cache::active_mut`] 重新激活。
+//!
+//! # 容量管理
+//!
+//! 缓存没有自动执行的硬容量上限。[`Cache::with_config`] 的 `map_capacity` 仅是
+//! 哈希表的初始容量。调用方应根据 [`Data::size`] 返回的大小，主动消费
+//! [`Cache::capacity_collect`]、[`Cache::capacity_ref_collect`] 或相应的超时清理
+//! 迭代器。
 
 use pi_hash::XHashMap;
 use pi_null::Null;
@@ -20,14 +37,22 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::replace;
 
-/// 最大频次
+/// 缓存支持的最大访问频次。
 const FREQUENCY_MAX: u32 = 15;
-// 默认CuckooFilter窗口大小
+/// 默认的 CuckooFilter 窗口大小。
+///
+/// 当前版本已不再启用 CuckooFilter；保留该公共常量仅用于兼容已有调用方。
 pub const WINDOW_SIZE: usize = 1024;
-// 默认的整理率，总放入次数/缓存总条目数
+/// 默认频次降级率。
+///
+/// 该值控制触发全局降频所需的操作数量，近似为当前槽位数的 `8` 倍。
+/// 参见 [`Cache::with_config`]。
 pub const FREQUENCY_DOWN_RATE: usize = 8;
 
-/// Cache缓存， 基于LFU-LRU
+/// 基于分段 LFU-LRU 的缓存。
+///
+/// `K` 用于定位条目和保存频次状态；`V` 通过 [`Data`] 向缓存报告大小和超时
+/// 时间。类型本身不提供内部同步，多线程共享时应由调用方使用锁或其他同步机制。
 pub struct Cache<K: Eq + Hash + Clone, V: Data> {
     /// 频率表
     lfu: Lfu<K, V>,
@@ -43,7 +68,16 @@ impl<K: Eq + Hash + Clone, V: Data> Default for Cache<K, V> {
     }
 }
 impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
-    /// 用初始表大小，CuckooFilter窗口大小，整理率创建Cache
+    /// 使用指定的哈希表初始容量和频次降级率创建缓存。
+    ///
+    /// # 参数
+    ///
+    /// - `map_capacity`：键索引哈希表的初始容量；传入 `0` 使用默认容量。它不是
+    ///   缓存大小上限，也不会使 [`put`](Self::put) 自动淘汰条目。
+    /// - `frequency_down_rate`：频次老化速率。值越小，历史频次衰减越快；值越大，
+    ///   热点保留越久。默认值为 [`FREQUENCY_DOWN_RATE`]。
+    ///
+    /// 降频阈值由当前槽位数动态计算，因此它表示近似比例，而不是固定操作次数。
     pub fn with_config(
         map_capacity: usize,
         // cuckoo_filter_window_size: usize,
@@ -60,14 +94,19 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             // filter: CuckooFilter::from_entries_per_index(cuckoo_filter_window_size, 0.01, 8),
         }
     }
-    /// 判断是否有指定键的数据
+    /// 判断指定键当前是否仍有可访问的数据。
+    ///
+    /// 正常条目和已标记为垃圾的条目返回 `true`；被 [`take`](Self::take) 取走或
+    /// 从未存在的键返回 `false`。
     pub fn contains_key(&self, k: &K) -> bool {
         if let Some(r) = self.map.get(k) {
             return !r.key.is_null();
         }
         false
     }
-    /// 获得指定键的频次
+    /// 查询指定键当前的频次或中间状态。
+    ///
+    /// 频次会根据已经发生的全局降频次数实时折算，返回值范围为 `0..=15`。
     pub fn get_frequency(&self, k: &K) -> FrequencyState {
         if let Some(r) = self.map.get(k) {
             return if r.key.is_null() {
@@ -80,7 +119,10 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         FrequencyState::None
     }
-    /// 获得指定键的数据  获取键对应的数据的不可变引用
+    /// 获取指定键对应值的共享引用。
+    ///
+    /// 该操作不会提升频次、改变 LRU 顺序或更新命中/未命中指标。已标记为垃圾的
+    /// 条目仍可通过本方法读取；被 [`take`](Self::take) 取走的条目返回 `None`。
     pub fn get(&self, k: &K) -> Option<&V> {
         if let Some(r) = self.map.get(k) {
             if !r.key.is_null() {
@@ -89,7 +131,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// GetMut by key 获取键对应的数据的可变引用
+    /// 获取指定键对应值的可变引用，但不激活条目。
+    ///
+    /// 该操作不会提升频次、改变 LRU 顺序或更新命中/未命中指标。如果修改会改变
+    /// [`Data::size`] 的结果，调用方还必须使用 [`adjust_size`](Self::adjust_size)
+    /// 修正缓存大小。需要记录一次访问时应改用 [`active_mut`](Self::active_mut)。
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get(k) {
             if !r.key.is_null() {
@@ -98,7 +144,13 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// adjust size  调整缓存总大小的统计，正数增加，负数减少
+    /// 调整缓存记录的总大小。
+    ///
+    /// 当调用方通过可变引用改变了条目的实际大小时，使用新旧大小的差值更新统计：
+    /// 正数增加总大小，负数减少总大小。
+    ///
+    /// 调用方必须保证减少量不超过当前记录的大小，否则后续 [`size`](Self::size)
+    /// 的无符号减法可能下溢。
     pub fn adjust_size(&mut self, size: isize) {
         if size > 0 {
             self.lfu.metrics.size_incr += size as u64;
@@ -106,7 +158,15 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             self.lfu.metrics.size_decr += -size as u64;
         }
     }
-    /// 拿走的数据， 如果拿到了数据，就必须保证会调用put还回来
+    /// 暂时取走指定键的值，同时保留其频次信息。
+    ///
+    /// 正常条目被取走后进入 [`FrequencyState::TakenAway`] 状态，并从缓存数量和
+    /// 大小中扣除。调用方应保证之后调用 [`put`](Self::put) 归还同一个键；若不再
+    /// 需要该键，应调用 [`remove`](Self::remove) 清除残留的频次记录。已经标记为
+    /// 垃圾的条目被取走时会直接从缓存删除。
+    ///
+    /// 正常条目被取走会增加命中计数，不存在的键会增加未命中计数；已经被取走的键
+    /// 返回 `None`。
     pub fn take(&mut self, k: &K) -> Option<V> {
         match self.map.entry(k.clone()) {
             hash_map::Entry::Occupied(mut e) => {
@@ -132,7 +192,13 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             }
         }
     }
-    /// 放入的数据，返回Some(V)表示被替换的数据
+    /// 插入、替换或归还一个条目。
+    ///
+    /// 新键以频次 `0` 插入；已有键会在当前有效频次上增加 `1`，最高为 `15`。
+    /// 本方法可能推进并触发全局降频，但不会依据容量自动清理条目。
+    ///
+    /// 如果键对应的值仍在缓存中，返回被替换的旧值；插入新键或归还一个由
+    /// [`take`](Self::take) 取走的键时返回 `None`。
     pub fn put(&mut self, k: K, v: V) -> Option<V> {
         // 先频降
         self.lfu.frequency_down();
@@ -179,7 +245,19 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
     }
 
-    /// 带频次的数据插入  不降频
+    /// 使用指定频次插入条目，且不推进全局降频计数。
+    ///
+    /// 对新键，`frequency` 是条目的初始频次；对已有键，它是增加到当前有效频次
+    /// 上的增量。已有键的最终频次会封顶到 `15`。
+    ///
+    /// # 参数约束
+    ///
+    /// `frequency` 应位于 `0..=15`。当前实现对新键直接使用该值选择内部队列，
+    /// 传入大于 `15` 的值可能因队列下标越界而 panic。
+    ///
+    /// # 返回值
+    ///
+    /// 如果键对应的值仍在缓存中，返回被替换的旧值；否则返回 `None`。
     pub fn put_with_frequency(&mut self, k: K, v: V, frequency: u32) -> Option<V> {
         match self.map.entry(k.clone()) {
             hash_map::Entry::Occupied(mut e) => {
@@ -215,7 +293,15 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
     }
 
-    /// 激活并获取可写应用，会增加频次和最后使用时间，等于拿走并立即还回来，但性能更高
+    /// 激活指定条目并获取其可变引用。
+    ///
+    /// 正常条目的频次增加 `1` 并移动到对应队列尾部；已标记为垃圾的条目会以
+    /// 频次 `1` 重新加入缓存。正常或垃圾状态的条目会增加命中指标，不存在的键会
+    /// 增加未命中指标，并可能触发全局降频。被 [`take`](Self::take) 取走的条目
+    /// 不能通过本方法激活，也不会增加未命中指标。
+    ///
+    /// 如果修改导致 [`Data::size`] 的返回值发生变化，调用方还必须使用
+    /// [`adjust_size`](Self::adjust_size) 修正缓存记录的大小。
     pub fn active_mut(&mut self, k: &K) -> Option<&mut V> {
         if let Some(r) = self.map.get_mut(k) {
             if r.key.is_null() {
@@ -251,7 +337,10 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         self.lfu.metrics.miss += 1;
         None
     }
-    /// 移走
+    /// 从缓存和频次表中彻底移除指定键。
+    ///
+    /// 正常条目或已标记为垃圾的条目会返回其值；被 [`take`](Self::take) 取走的
+    /// 条目只有频次记录可删除，因此返回 `None`。不存在的键同样返回 `None`。
     pub fn remove(&mut self, k: &K) -> Option<V> {
         if let Some(r) = self.map.remove(k) {
             // 已经被拿走，则只移除频率
@@ -270,7 +359,13 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// 将指定键的数据标记为垃圾回收，从频率队列中移除，但保留数据本身， 返回数据引用
+    /// 将指定条目标记为垃圾并返回其共享引用。
+    ///
+    /// 标记会把条目移出频次队列，但值和键索引仍被保留，其状态变为
+    /// [`FrequencyState::Garbaged`]。之后可以调用 [`collect`](Self::collect) 真正
+    /// 移除，也可以调用 [`active_mut`](Self::active_mut) 重新加入频次队列。
+    ///
+    /// 已被取走、已经标记为垃圾或不存在的条目返回 `None`。
     pub fn garbage(&mut self, k: &K) -> Option<&V> {
         if let Some(r) = self.map.get_mut(&k) {
             // 已经被拿走，或垃圾回收状态，不可标记
@@ -293,7 +388,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         None
     }
-    /// 移走垃圾回收的数据
+    /// 真正移除一个已标记为垃圾的条目。
+    ///
+    /// 只有状态为 [`FrequencyState::Garbaged`] 的条目会被移除并返回值；正常条目、
+    /// 已被取走的条目和不存在的键均返回 `None`。每次调用都会增加
+    /// [`Metrics::collect`]，无论是否成功移除条目。
     pub fn collect(&mut self, k: K) -> Option<V> {
         self.lfu.metrics.collect += 1;
         match self.map.entry(k) {
@@ -308,23 +407,38 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             _ => None,
         }
     }
-    /// 全部的频率信息数量，包括被拿走的数据
+    /// 返回键索引中保存的记录总数。
+    ///
+    /// 该数量包括正常条目、被 [`take`](Self::take) 取走后保留的频次记录，以及
+    /// 已标记为垃圾但尚未 [`collect`](Self::collect) 的条目，因此可能大于
+    /// [`len`](Self::len)。
     pub fn frequency_len(&self) -> usize {
         self.map.len()
     }
-    /// 当前数量，被缓存的数据数量
+    /// 返回统计指标记录的当前缓存条目数。
+    ///
+    /// 结果由 [`Metrics::len_incr`] 减去 [`Metrics::len_decr`] 得到，并不等同于
+    /// 键索引记录数；需要包含中间状态记录的数量时使用 [`frequency_len`](Self::frequency_len)。
     pub fn len(&self) -> usize {
         self.lfu.metrics.len_incr - self.lfu.metrics.len_decr
     }
-    /// 当前缓存的数据总大小
+    /// 返回统计指标记录的当前缓存总大小。
+    ///
+    /// 大小由各条目的 [`Data::size`] 以及 [`adjust_size`](Self::adjust_size) 的手动
+    /// 调整累计得到，单位由 `Data` 实现自行约定，通常使用字节。
     pub fn size(&self) -> usize {
         (self.lfu.metrics.size_incr - self.lfu.metrics.size_decr) as usize
     }
-    /// 获得当前的统计
+    /// 返回当前累计指标的快照。
+    ///
+    /// 指标不会因读取而清零；返回的是 [`Metrics`] 的克隆值。
     pub fn metrics(&self) -> Metrics {
         self.lfu.metrics.clone()
     }
-    /// 迭代器，按频率由低到高，同频率先进先出的顺序迭代
+    /// 按淘汰优先级遍历当前位于频次队列中的条目。
+    ///
+    /// 遍历顺序为频次从低到高，同一频次段内从最早进入队列到最晚进入队列。
+    /// 被取走或已标记为垃圾的条目不在频次队列中，因此不会被返回。
     pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             cache: self,
@@ -332,7 +446,15 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             index: 1,
         }
     }
-    /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
+    /// 创建一个超时引用清理迭代器。
+    ///
+    /// 当缓存大小大于 `capacity` 时，迭代器按淘汰优先级检查各频次段的队首；若
+    /// 队首条目的 [`Data::timeout`] 严格小于 `now`，则将其标记为垃圾并返回引用。
+    /// 清理在大小降至 `capacity` 或没有更多符合条件的队首条目时结束。
+    ///
+    /// 返回的条目仍占用槽位，调用方需要在引用不再使用后通过
+    /// [`collect`](Self::collect) 真正移除，或通过 [`active_mut`](Self::active_mut)
+    /// 重新激活。
     pub fn timeout_ref_collect(&mut self, capacity: usize, now: u64) -> TimeoutRefIter<'_, K, V> {
         TimeoutRefIter {
             cache: self as *mut Self,
@@ -342,7 +464,12 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             _p: PhantomData,
         }
     }
-    /// 超量整理方法， 参数为容量， 按照频率优先， 同频先进先出的原则，清理超出容量的数据
+    /// 创建一个容量引用清理迭代器。
+    ///
+    /// 迭代器按低频优先、同频段先进先出的顺序，把条目标记为垃圾并返回引用，直到
+    /// 缓存记录的大小不大于 `capacity`。返回的值尚未从槽位释放，之后需要调用
+    /// [`collect`](Self::collect) 真正移除，或调用 [`active_mut`](Self::active_mut)
+    /// 重新激活。
     pub fn capacity_ref_collect(&mut self, capacity: usize) -> CapacityRefIter<'_, K, V> {
         CapacityRefIter {
             cache: self as *mut Self,
@@ -351,7 +478,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             _p: PhantomData,
         }
     }
-    /// 超时整理方法， 参数为最小容量及毫秒时间，清理最小容量外的超时数据
+    /// 创建一个会取得条目所有权的超时清理迭代器。
+    ///
+    /// 当缓存大小大于 `capacity` 时，迭代器按淘汰优先级检查各频次段的队首；若
+    /// 队首条目的 [`Data::timeout`] 严格小于 `now`，则彻底移除并返回该条目。
+    /// `capacity` 是停止清理的大小下限，不是条目数量。
     pub fn timeout_collect(&mut self, capacity: usize, now: u64) -> TimeoutIter<'_, K, V> {
         TimeoutIter {
             cache: self,
@@ -360,7 +491,10 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             now,
         }
     }
-    /// 超量整理方法， 参数为容量， 按照频率优先， 同频先进先出的原则，清理超出容量的数据
+    /// 创建一个会取得条目所有权的容量清理迭代器。
+    ///
+    /// 迭代器按低频优先、同频段先进先出的顺序彻底移除并返回条目，直到缓存记录的
+    /// 大小不大于 `capacity`。如果单个条目就大于目标容量，它最终也会被淘汰。
     pub fn capacity_collect(&mut self, capacity: usize) -> CapacityIter<'_, K, V> {
         CapacityIter {
             cache: self,
@@ -369,7 +503,11 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
     }
 
-    /// 获取所有有效项的核心元数据
+    /// 收集当前所有有效条目的核心元数据。
+    ///
+    /// 结果遵循 [`iter`](Self::iter) 的顺序，仅包含仍位于频次队列中的条目，不含
+    /// 被取走或已标记为垃圾的条目。该方法会克隆每个键，可用于在外部序列化缓存
+    /// 状态并结合 [`put_with_frequency`](Self::put_with_frequency) 重建条目。
     pub fn items_metas(&self) -> Vec<ItemMeta<K>> {
         let mut metas: Vec<ItemMeta<K>> = Vec::new();
         for r in self.iter() {
@@ -387,32 +525,51 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     }
 }
 
-/// 缓存项的完整元数据（用于序列化和重建）
+/// 用于序列化或重建缓存条目的核心元数据。
+///
+/// 元数据不包含值本身。调用方可以单独序列化值，并使用
+/// [`Cache::put_with_frequency`] 恢复条目的初始频次。
 #[derive(Debug)]
 pub struct ItemMeta<K> {
-    /// 键值
+    /// 条目的键。
     pub key: K,
-    /// 当前实际频次
+    /// 已考虑全局降频后的当前有效频次，范围为 `0..=15`。
     pub frequency: u8,
-    /// 数据占用内存大小
+    /// 由 [`Data::size`] 报告的条目大小。
     pub size: usize,
-    /// 数据超时时间戳（0表示永不过期）
+    /// 由 [`Data::timeout`] 报告的超时时间值。
     pub timeout: u64,
 }
 
-/// 数据，放入数据表的数据必须实现该trait
+/// 缓存值需要提供的大小和超时信息。
+///
+/// 缓存不会校验这两个值的单位或单调性。实现方应保证同一个缓存中的所有值使用
+/// 一致的大小单位和时间基准。
 pub trait Data {
-    /// 数据的大小
+    /// 返回该值计入缓存容量的大小。
+    ///
+    /// 默认返回 `1`，此时容量清理等价于按条目数量控制容量。若返回字节数，
+    /// [`Cache::size`] 和各清理接口的 `capacity` 参数也都以字节为单位。
+    ///
+    /// 值在缓存期间大小发生变化时，调用方应使用 [`Cache::adjust_size`] 同步差值。
     fn size(&self) -> usize {
         1
     }
-    /// 数据的超时时间，毫秒时间
+    /// 返回该值的超时时间。
+    ///
+    /// 默认返回 `0`。超时清理接口使用 `timeout() < now` 作为过期条件，因此调用方
+    /// 必须为 `timeout` 和 `now` 使用相同的时间基准；在当前实现中，当 `now > 0`
+    /// 时，默认值 `0` 会被视为已经过期。
     fn timeout(&self) -> u64 {
         0
     }
 }
 
-/// 超时引用迭代器
+/// 将过期条目标记为垃圾并借用返回的惰性迭代器。
+///
+/// 仅创建迭代器不会执行清理，调用方必须消费迭代器。每次迭代可能修改缓存的队列
+/// 和统计信息，但值仍保存在缓存槽位中。通常通过
+/// [`Cache::timeout_ref_collect`] 创建。
 pub struct TimeoutRefIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: *mut Cache<K, V>,
     index: usize,
@@ -447,7 +604,11 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutRefIter<'a, K, V> {
     }
 }
 
-/// 容量引用迭代器
+/// 将超出目标容量的条目标记为垃圾并借用返回的惰性迭代器。
+///
+/// 仅创建迭代器不会执行清理，调用方必须消费迭代器。值在后续调用
+/// [`Cache::collect`] 前仍保存在缓存槽位中。通常通过
+/// [`Cache::capacity_ref_collect`] 创建。
 pub struct CapacityRefIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: *mut Cache<K, V>,
     index: usize,
@@ -479,7 +640,10 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityRefIter<'a, K, V> {
     }
 }
 
-/// 超时迭代器
+/// 彻底移除并返回过期条目所有权的惰性迭代器。
+///
+/// 仅创建迭代器不会执行清理，调用方必须消费迭代器。通常通过
+/// [`Cache::timeout_collect`] 创建。
 pub struct TimeoutIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: &'a mut Cache<K, V>,
     index: usize,
@@ -515,7 +679,10 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for TimeoutIter<'a, K, V> {
     }
 }
 
-/// 容量迭代器
+/// 彻底移除并返回超出目标容量条目所有权的惰性迭代器。
+///
+/// 仅创建迭代器不会执行清理，调用方必须消费迭代器。通常通过
+/// [`Cache::capacity_collect`] 创建。
 pub struct CapacityIter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: &'a mut Cache<K, V>,
     index: usize,
@@ -542,7 +709,10 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for CapacityIter<'a, K, V> {
         None
     }
 }
-/// 迭代器
+/// 按淘汰优先级借用缓存条目的迭代器。
+///
+/// 该迭代器只访问频次队列，不返回被取走或已标记为垃圾的条目。通常通过
+/// [`Cache::iter`] 创建。
 pub struct Iter<'a, K: Eq + Hash + Clone, V: Data> {
     cache: &'a Cache<K, V>,
     iter: SlotIter<'a, DefaultKey, (K, V)>,
@@ -565,50 +735,54 @@ impl<'a, K: Eq + Hash + Clone, V: Data> Iterator for Iter<'a, K, V> {
         }
     }
 }
-/// 数据的频率状态
+/// 键在频次表中的当前状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrequencyState {
-    /// 不存在
+    /// 键不存在，且没有保留频次信息。
     None,
-    /// 被拿走
+    /// 值已通过 [`Cache::take`] 取走，但键和频次信息仍被保留。
     TakenAway,
-    /// 被标记为垃圾
+    /// 条目已移出频次队列，但值仍等待 [`Cache::collect`] 清理。
     Garbaged,
-    /// 频率
+    /// 正常条目的当前有效频次，范围为 `0..=15`。
     Frequency(u8),
 }
-/// 统计数据
+/// 缓存生命周期内累计的操作和容量指标。
+///
+/// [`Cache::metrics`] 返回该结构的快照。计数器不会自动清零；其中 `len_*` 和
+/// `size_*` 是增减累计值，[`Cache::len`] 与 [`Cache::size`] 通过两者相减得到
+/// 当前统计值。
 #[derive(Clone, Default, Debug)]
 pub struct Metrics {
-    /// 数量增加次数
+    /// 用于计算当前条目数的累计增加量。
     pub len_incr: usize,
-    /// 数量减少次数
+    /// 用于计算当前条目数的累计减少量。
     pub len_decr: usize,
-    /// 大小增加次数
+    /// 插入值及手动调整产生的累计大小增加量。
     pub size_incr: u64,
-    /// 大小减少次数
+    /// 移除值及手动调整产生的累计大小减少量。
     pub size_decr: u64,
-    /// 命中次数
+    /// `take` 或 `active_mut` 成功命中的累计次数。
     pub hit: usize,
-    /// 未命中次数
+    /// `take` 或 `active_mut` 未命中的累计次数。
     pub miss: usize,
-    /// 首次插入的次数
+    /// 新键首次插入的累计次数。
     pub insert1: usize,
-    /// 二次插入的次数
+    /// CuckooFilter 二次命中插入次数；当前实现未启用过滤器，通常保持为 `0`。
     pub insert2: usize,
-    /// 替换次数
+    /// 已存在值被新值替换的累计次数。
     pub replace: usize,
-    /// 归还次数
+    /// 被取走条目的归还及条目激活累计次数。
     pub put: usize,
-    /// 移除次数
+    /// 通过 [`Cache::remove`] 移除有值条目的累计次数。
     pub remove: usize,
-    /// 垃圾标记次数
+    /// 通过 [`Cache::garbage`] 主动标记垃圾的累计次数。
     pub garbage: usize,
-    /// 垃圾清理次数
+    /// 调用 [`Cache::collect`] 的累计次数，包括未移除条目的调用。
     pub collect: usize,
-    /// 超时清理次数
+    /// 两种超时清理迭代器产出的累计条目数。
     pub timeout: usize,
-    /// 超过容量的驱除次数
+    /// 两种容量清理迭代器产出的累计条目数。
     pub evict: usize,
 }
 
