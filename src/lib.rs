@@ -36,9 +36,20 @@ use std::collections::hash_map;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::replace;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 缓存支持的最大访问频次。
 const FREQUENCY_MAX: u32 = 15;
+
+/// 返回当前 Unix 毫秒时间戳。
+///
+/// 系统时间早于 Unix 纪元时返回 `0`；超出 `u64` 表示范围时截断为 `u64::MAX`。
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
 /// 默认的 CuckooFilter 窗口大小。
 ///
 /// 当前版本已不再启用 CuckooFilter；保留该公共常量仅用于兼容已有调用方。
@@ -119,6 +130,19 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
         }
         FrequencyState::None
     }
+    /// 返回指定键最后一次被激活的 Unix 毫秒时间戳。
+    ///
+    /// [`put`](Self::put) 插入、替换或归还条目，以及
+    /// [`active_mut`](Self::active_mut) 成功激活条目时会更新时间戳。
+    /// [`get`](Self::get)、[`get_mut`](Self::get_mut)、[`take`](Self::take) 和
+    /// [`put_with_frequency`](Self::put_with_frequency) 不更新时间戳。
+    ///
+    /// 条目不存在或仅通过 `put_with_frequency` 写入且从未被激活时返回 `None`。
+    /// 被 `take` 取走或已标记为垃圾的条目会保留已有时间戳，直到条目被彻底移除。
+    /// 时间来自系统时钟，可能受到系统时间校准影响，不保证严格单调递增。
+    pub fn get_last_active_time(&self, k: &K) -> Option<u64> {
+        self.map.get(k).and_then(|item| item.last_active_time)
+    }
     /// 获取指定键对应值的共享引用。
     ///
     /// 该操作不会提升频次、改变 LRU 顺序或更新命中/未命中指标。已标记为垃圾的
@@ -196,15 +220,19 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     ///
     /// 新键以频次 `0` 插入；已有键会在当前有效频次上增加 `1`，最高为 `15`。
     /// 本方法可能推进并触发全局降频，但不会依据容量自动清理条目。
+    /// 无论是插入、替换还是归还条目，都会把最后激活时间更新为当前 Unix 毫秒
+    /// 时间戳，可通过 [`get_last_active_time`](Self::get_last_active_time) 查询。
     ///
     /// 如果键对应的值仍在缓存中，返回被替换的旧值；插入新键或归还一个由
     /// [`take`](Self::take) 取走的键时返回 `None`。
     pub fn put(&mut self, k: K, v: V) -> Option<V> {
         // 先频降
         self.lfu.frequency_down();
+        let active_time = unix_time_millis();
         match self.map.entry(k.clone()) {
             hash_map::Entry::Occupied(mut e) => {
                 let r = e.get_mut();
+                r.last_active_time = Some(active_time);
                 // 获取新旧位置
                 let (i, old_i) = r.put(self.lfu.frequency_down_count);
                 if !r.key.is_null() {
@@ -239,6 +267,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                     key,
                     frequency: 0,
                     frequency_down_count: self.lfu.frequency_down_count,
+                    last_active_time: Some(active_time),
                 });
                 None
             }
@@ -287,6 +316,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
                     key,
                     frequency,
                     frequency_down_count: self.lfu.frequency_down_count,
+                    last_active_time: None,
                 });
                 None
             }
@@ -299,6 +329,8 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
     /// 频次 `1` 重新加入缓存。正常或垃圾状态的条目会增加命中指标，不存在的键会
     /// 增加未命中指标，并可能触发全局降频。被 [`take`](Self::take) 取走的条目
     /// 不能通过本方法激活，也不会增加未命中指标。
+    /// 成功激活时，最后激活时间会更新为当前 Unix 毫秒时间戳；返回 `None` 时不会
+    /// 更新时间。时间可通过 [`get_last_active_time`](Self::get_last_active_time) 查询。
     ///
     /// 如果修改导致 [`Data::size`] 的返回值发生变化，调用方还必须使用
     /// [`adjust_size`](Self::adjust_size) 修正缓存记录的大小。
@@ -307,6 +339,7 @@ impl<K: Eq + Hash + Clone, V: Data> Cache<K, V> {
             if r.key.is_null() {
                 return None;
             }
+            r.last_active_time = Some(unix_time_millis());
             // 先频降
             self.lfu.frequency_down();
             self.lfu.metrics.hit += 1;
@@ -858,6 +891,8 @@ struct Item {
     frequency: u32,
     /// 当前频次所在的频降周期数，为0表示在垃圾回收状态
     frequency_down_count: u32,
+    /// 最近一次由 `put` 或 `active_mut` 更新的 Unix 毫秒时间戳。
+    last_active_time: Option<u64>,
 }
 impl Item {
     #[inline]
@@ -946,6 +981,39 @@ mod test_mod {
         fn timeout(&self) -> u64 {
             self.2
         }
+    }
+
+    #[test]
+    fn last_active_time_is_updated_only_by_put_and_active_mut() {
+        let mut cache: Cache<usize, R1> = Default::default();
+
+        assert_eq!(cache.get_last_active_time(&1), None);
+
+        cache.put_with_frequency(1, R1(1, 1, 1), 3);
+        assert_eq!(cache.get_last_active_time(&1), None);
+
+        cache.map.get_mut(&1).unwrap().last_active_time = Some(1);
+        cache.put_with_frequency(1, R1(1, 1, 2), 1);
+        assert_eq!(cache.get_last_active_time(&1), Some(1));
+
+        assert!(cache.get(&1).is_some());
+        assert_eq!(cache.get_last_active_time(&1), Some(1));
+        assert!(cache.get_mut(&1).is_some());
+        assert_eq!(cache.get_last_active_time(&1), Some(1));
+
+        assert!(cache.active_mut(&1).is_some());
+        assert!(cache.get_last_active_time(&1).unwrap() > 1);
+
+        cache.map.get_mut(&1).unwrap().last_active_time = Some(1);
+        cache.put(1, R1(1, 1, 3));
+        assert!(cache.get_last_active_time(&1).unwrap() > 1);
+
+        cache.map.get_mut(&1).unwrap().last_active_time = Some(1);
+        assert!(cache.take(&1).is_some());
+        assert_eq!(cache.get_last_active_time(&1), Some(1));
+
+        cache.put(2, R1(2, 1, 1));
+        assert!(cache.get_last_active_time(&2).unwrap() > 1);
     }
 
     #[test]
